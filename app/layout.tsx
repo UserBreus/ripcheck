@@ -27,14 +27,14 @@ export async function generateMetadata(): Promise<Metadata> {
     openGraph: {
       title: "RIPcheck — Verifica antes de imprimir",
       description: "Preflight preventivo de PDF y AI para sublimación.",
-      images: [{ url: "/og.png", width: 1734, height: 907, alt: "RIPcheck, preflight para sublimación" }],
+      images: [{ url: "/og-v2.png", width: 1734, height: 907, alt: "RIPcheck, comparación de archivos para sublimación" }],
       type: "website",
     },
     twitter: {
       card: "summary_large_image",
       title: "RIPcheck — Verifica antes de imprimir",
       description: "Preflight preventivo de PDF y AI para sublimación.",
-      images: ["/og.png"],
+      images: ["/og-v2.png"],
     },
   };
 }
