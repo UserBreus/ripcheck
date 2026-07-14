@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
-import { decodedContentStreams, inspectPdfStructure, type LayerState } from "./pdf-structure";
+import { decodedContentStreams, embeddedIccProfiles, extractSourceColors, inspectPdfStructure, type LayerState, type PdfSourceColor } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
 type Status = "ready" | "caution" | "blocked";
@@ -25,6 +25,7 @@ type Analysis = {
   checks: Check[];
   colorSpaces: string[];
   dominantColors: string[];
+  sourceColors: PdfSourceColor[];
   spotColors: string[];
   profileName: string;
   fontNames: string[];
@@ -113,7 +114,8 @@ function uniqueMatches(text: string, pattern: RegExp, limit = 24) {
   return Array.from(values);
 }
 
-function detectProfile(text: string) {
+function detectProfile(text: string, embeddedProfiles: string[] = []) {
+  if (embeddedProfiles.length) return embeddedProfiles.slice(0, 3).join(" · ");
   const outputId = text.match(/\/OutputConditionIdentifier\s*\(([^)]+)\)/)?.[1];
   if (outputId) return outputId.trim();
   const common = text.match(/sRGB IEC61966-2\.1|Adobe RGB \(1998\)|Display P3|U\.S\. Web Coated \(SWOP\) v2|ISO Coated v2(?: 300%)?|Coated FOGRA\d+|FOGRA\d+|GRACoL[^()<>{}\r\n]*/i)?.[0];
@@ -228,6 +230,7 @@ function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
     checks: [{ ...check, scope: check.scope || "rip" }],
     colorSpaces: [],
     dominantColors: [],
+    sourceColors: [],
     spotColors: [],
     profileName: "No detectable",
     fontNames: [],
@@ -280,6 +283,8 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const inspectionText = `${raw}\n${contentText}`;
   const crossReference = validateCrossReference(bytes);
   const pdfStructure = inspectPdfStructure(raw, contentText);
+  const sourceColors = extractSourceColors(raw, contentText);
+  const embeddedProfiles = await embeddedIccProfiles(bytes, raw);
 
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -359,7 +364,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   if (/\/Lab\b/.test(inspectionText)) colorSpaces.push("Lab");
   if (/\/(?:Separation|DeviceN)\b/.test(inspectionText)) colorSpaces.push("Tintas directas");
   const spotColors = uniqueMatches(inspectionText, /\/Separation\s*\/([^\s/<>{}\[\]()]+)/g, 12);
-  const profileName = detectProfile(raw);
+  const profileName = detectProfile(raw, embeddedProfiles);
   const ppiMin = ppiValues.length ? Math.round(Math.min(...ppiValues)) : null;
   const ppiMax = ppiValues.length ? Math.round(Math.max(...ppiValues)) : null;
   const hasText = textCharacters > 0;
@@ -484,6 +489,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     checks,
     colorSpaces,
     dominantColors: detectedColors,
+    sourceColors,
     spotColors,
     profileName,
     fontNames: Array.from(fontNames).slice(0, 16),
@@ -524,21 +530,18 @@ function resourceIntegrityLabel(analysis: Analysis) {
     : "Recursos coherentes";
 }
 
-function colorComposition(hex: string) {
-  const normalized = hex.replace("#", "");
-  const r = Number.parseInt(normalized.slice(0, 2), 16);
-  const g = Number.parseInt(normalized.slice(2, 4), 16);
-  const b = Number.parseInt(normalized.slice(4, 6), 16);
-  const red = r / 255;
-  const green = g / 255;
-  const blue = b / 255;
-  const k = 1 - Math.max(red, green, blue);
-  const divisor = 1 - k;
-  const c = divisor === 0 ? 0 : (1 - red - k) / divisor;
-  const m = divisor === 0 ? 0 : (1 - green - k) / divisor;
-  const y = divisor === 0 ? 0 : (1 - blue - k) / divisor;
-  const percent = (value: number) => Math.round(Math.max(0, Math.min(1, value)) * 100);
-  return { hex: `#${normalized.toUpperCase()}`, rgb: [r, g, b], cmyk: [percent(c), percent(m), percent(y), percent(k)] };
+function sourceColorValues(color: PdfSourceColor) {
+  const value = (number: number) => `${Number((number * 100).toFixed(1))}%`;
+  if (color.space === "CMYK") return ["C", "M", "Y", "K"].map((channel, index) => `${channel} ${value(color.values[index])}`).join(" · ");
+  if (color.space === "RGB") return ["R", "G", "B"].map((channel, index) => `${channel} ${value(color.values[index])}`).join(" · ");
+  if (color.space === "Gray") return `GRIS ${value(color.values[0])}`;
+  return color.values.map((number, index) => `T${index + 1} ${value(number)}`).join(" · ");
+}
+
+function sourceColorSummary(analysis: Analysis) {
+  return analysis.sourceColors.length
+    ? analysis.sourceColors.slice(0, 8).map((color) => `${color.space} ${sourceColorValues(color)}`).join(" / ")
+    : "No extraíble desde operadores";
 }
 
 function qualityLabel(status: Status) {
@@ -650,7 +653,7 @@ export function PreflightApp() {
         `${analysis.fileName} — Compatibilidad: ${statusLabel(analysis.status)} · ${qualityLabel(analysis.qualityStatus)}`,
         `Formato: ${analysis.format} · Páginas: ${analysis.pages ?? "—"} · Tamaño: ${analysis.dimensions.join(" / ") || "—"}`,
         `PPI reales: ${ppiLabel(analysis)} · Perfil: ${analysis.profileName}`,
-        `Color: ${analysis.colorSpaces.join(" + ") || "No concluyente"} · Colores visuales: ${analysis.dominantColors.join(", ") || "—"}`,
+        `Color: ${analysis.colorSpaces.join(" + ") || "No concluyente"} · Colores originales: ${sourceColorSummary(analysis)}`,
         `Texto: ${analysis.hasText ? `Sí, ${analysis.textCharacters} caracteres` : "No detectado"}`,
         ...analysis.checks.map((check) => `[${check.severity.toUpperCase()}] ${check.title}: ${check.detail}`),
         "",
@@ -728,8 +731,7 @@ export function PreflightApp() {
 
 function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: number }) {
   const [selectedColor, setSelectedColor] = useState<string | null>(null);
-  const activeColor = selectedColor && analysis.dominantColors.includes(selectedColor) ? selectedColor : analysis.dominantColors[0] || null;
-  const composition = activeColor ? colorComposition(activeColor) : null;
+  const activeColor = analysis.sourceColors.find((color) => color.id === selectedColor) || analysis.sourceColors[0] || null;
   const groups = {
     ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
     ripWarnings: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "warning"),
@@ -741,7 +743,7 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
     <div className="visual-column">
       <div className="detail-heading"><span>Vista real · primera página</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
       <div className="thumb-stage">{analysis.thumbnail ? <img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación visual compatible.</p></div>}</div>
-      <div className="color-readout"><span>COLORES VISUALES DETECTADOS</span><div className="color-swatches">{analysis.dominantColors.length ? analysis.dominantColors.map((color) => <button key={color} className={activeColor === color ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color }} onClick={() => setSelectedColor(color)} aria-label={`Mostrar composición de ${color}`} aria-pressed={activeColor === color} title={`Ver composición de ${color}`} />) : <small>No concluyente</small>}</div>{composition && <div className="color-composition"><div><span>HEX</span><b>{composition.hex}</b></div><div><span>RGB</span><b>{composition.rgb.join(" · ")}</b></div><div><span>CMYK</span><b>{composition.cmyk.map((value) => `${value}%`).join(" · ")}</b></div></div>}<small>Presiona un color para ver su composición. CMYK es una conversión aproximada del color visible renderizado.</small></div>
+      <div className="color-readout"><span>COLORES REALES DEL ARCHIVO</span><div className="color-swatches">{analysis.sourceColors.length ? analysis.sourceColors.map((color) => <button key={color.id} className={activeColor?.id === color.id ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color.preview }} onClick={() => setSelectedColor(color.id)} aria-label={`Mostrar ${color.space}: ${sourceColorValues(color)}`} aria-pressed={activeColor?.id === color.id} title={`${color.space} · ${sourceColorValues(color)}`} />) : <small>No se encontraron colores vectoriales extraíbles.</small>}</div>{activeColor && <div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>VISTA APROX.</span><b>{activeColor.preview}</b></div></div>}<small>Valores leídos directamente de los operadores del PDF. La muestra visual es aproximada; los porcentajes y el perfil son los datos originales.</small></div>
     </div>
     <div className="technical-column">
       <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
@@ -774,7 +776,7 @@ function Comparison({ items }: { items: BatchItem[] }) {
     { label: "PPI reales", get: ppiLabel },
     { label: "Perfil ICC", get: (a: Analysis) => a.profileName },
     { label: "Espacios de color", get: (a: Analysis) => a.colorSpaces.join(" + ") || "No concluyente" },
-    { label: "Colores dominantes", get: (a: Analysis) => a.dominantColors.join(" · ") || "—" },
+    { label: "Colores originales", get: sourceColorSummary },
     { label: "Texto", get: (a: Analysis) => a.hasText ? `Sí · ${a.textCharacters} caracteres` : "No detectado" },
     { label: "Integridad de recursos", get: resourceIntegrityLabel },
     { label: "Capas PDF", get: layerLabel },
