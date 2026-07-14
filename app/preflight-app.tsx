@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, useMemo, useRef, useState } from "react";
 import { decodedContentStreams, embeddedIccProfiles, extractSourceColors, inspectPdfStructure, type LayerState, type PdfSourceColor } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
@@ -538,6 +538,33 @@ function sourceColorValues(color: PdfSourceColor) {
   return color.values.map((number, index) => `T${index + 1} ${value(number)}`).join(" · ");
 }
 
+function hexToRgb(hex: string) {
+  const normalized = hex.replace("#", "");
+  if (!/^[0-9a-f]{6}$/i.test(normalized)) return null;
+  return {
+    r: Number.parseInt(normalized.slice(0, 2), 16),
+    g: Number.parseInt(normalized.slice(2, 4), 16),
+    b: Number.parseInt(normalized.slice(4, 6), 16),
+  };
+}
+
+function nearestSourceColor(colors: PdfSourceColor[], sampledHex: string) {
+  const sampled = hexToRgb(sampledHex);
+  if (!sampled) return null;
+  let nearest: { color: PdfSourceColor; distance: number } | null = null;
+  for (const color of colors) {
+    const preview = hexToRgb(color.preview);
+    if (!preview) continue;
+    const distance = Math.sqrt(
+      (sampled.r - preview.r) ** 2 +
+      (sampled.g - preview.g) ** 2 +
+      (sampled.b - preview.b) ** 2,
+    );
+    if (!nearest || distance < nearest.distance) nearest = { color, distance };
+  }
+  return nearest;
+}
+
 function sourceColorSummary(analysis: Analysis) {
   return analysis.sourceColors.length
     ? analysis.sourceColors.slice(0, 8).map((color) => `${color.space} ${sourceColorValues(color)}`).join(" / ")
@@ -731,7 +758,36 @@ export function PreflightApp() {
 
 function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: number }) {
   const [selectedColor, setSelectedColor] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [eyedropper, setEyedropper] = useState(false);
+  const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number; hex: string; distance: number | null } | null>(null);
   const activeColor = analysis.sourceColors.find((color) => color.id === selectedColor) || analysis.sourceColors[0] || null;
+  const currentSample = sampledPoint?.analysisId === analysis.id ? sampledPoint : null;
+  const changeZoom = (amount: number) => setZoom((current) => Math.min(4, Math.max(0.5, Number((current + amount).toFixed(2)))));
+  const samplePreview = (event: ReactMouseEvent<HTMLImageElement>) => {
+    if (!eyedropper) return;
+    const image = event.currentTarget;
+    const bounds = image.getBoundingClientRect();
+    if (!bounds.width || !bounds.height || !image.naturalWidth || !image.naturalHeight) return;
+    const x = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+    const y = Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return;
+    context.drawImage(image, 0, 0);
+    const pixel = context.getImageData(
+      Math.min(canvas.width - 1, Math.floor(x * canvas.width)),
+      Math.min(canvas.height - 1, Math.floor(y * canvas.height)),
+      1,
+      1,
+    ).data;
+    const hex = `#${[pixel[0], pixel[1], pixel[2]].map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+    const nearest = nearestSourceColor(analysis.sourceColors, hex);
+    if (nearest) setSelectedColor(nearest.color.id);
+    setSampledPoint({ analysisId: analysis.id, x, y, hex, distance: nearest?.distance ?? null });
+  };
   const groups = {
     ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
     ripWarnings: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "warning"),
@@ -742,8 +798,9 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
   return <section className="file-detail">
     <div className="visual-column">
       <div className="detail-heading"><span>Vista real · primera página</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
-      <div className="thumb-stage">{analysis.thumbnail ? <img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación visual compatible.</p></div>}</div>
-      <div className="color-readout"><span>COLORES REALES DEL ARCHIVO</span><div className="color-swatches">{analysis.sourceColors.length ? analysis.sourceColors.map((color) => <button key={color.id} className={activeColor?.id === color.id ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color.preview }} onClick={() => setSelectedColor(color.id)} aria-label={`Mostrar ${color.space}: ${sourceColorValues(color)}`} aria-pressed={activeColor?.id === color.id} title={`${color.space} · ${sourceColorValues(color)}`} />) : <small>No se encontraron colores vectoriales extraíbles.</small>}</div>{activeColor && <div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>VISTA APROX.</span><b>{activeColor.preview}</b></div></div>}<small>Valores leídos directamente de los operadores del PDF. La muestra visual es aproximada; los porcentajes y el perfil son los datos originales.</small></div>
+      <div className="preview-toolbar" aria-label="Controles de la vista real"><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
+      <div className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"}>{analysis.thumbnail ? <div className="zoom-surface" style={{ width: `${zoom * 100}%` }}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} onClick={samplePreview} draggable={false} />{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación visual compatible.</p></div>}</div>
+      <div className="color-readout"><span>COLORES REALES DEL ARCHIVO</span><div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? "Haz clic sobre cualquier punto de la vista real." : "Actívalo para inspeccionar un punto del diseño."}</small></div><div className="color-swatches">{analysis.sourceColors.length ? analysis.sourceColors.map((color) => <button key={color.id} className={activeColor?.id === color.id ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color.preview }} onClick={() => { setSelectedColor(color.id); setSampledPoint(null); }} aria-label={`Mostrar ${color.space}: ${sourceColorValues(color)}`} aria-pressed={activeColor?.id === color.id} title={`${color.space} · ${sourceColorValues(color)}`} />) : <small>No se encontraron colores vectoriales extraíbles.</small>}</div>{currentSample && <div className="sample-result"><span className="sample-chip" style={{ backgroundColor: currentSample.hex }} /><div><span>PUNTO MUESTREADO</span><b>{currentSample.hex} · RGB visible</b></div><small>{activeColor ? "Vinculado al color original más cercano" : "Sin color original extraíble para vincular"}</small></div>}{activeColor && <div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>VISTA APROX.</span><b>{activeColor.preview}</b></div></div>}<small>{currentSample ? "El cuentagotas usa la vista para localizar el punto y muestra la composición original más cercana del PDF. Los porcentajes y el perfil provienen del archivo." : "Valores leídos directamente de los operadores del PDF. La muestra visual es aproximada; los porcentajes y el perfil son los datos originales."}</small></div>
     </div>
     <div className="technical-column">
       <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
