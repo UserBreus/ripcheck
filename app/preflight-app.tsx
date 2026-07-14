@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
 import { decodedContentStreams, embeddedIccProfiles, extractSourceColors, inspectPdfStructure, type LayerState, type PdfSourceColor } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
@@ -745,7 +745,7 @@ export function PreflightApp() {
             {items.map(({ analysis }) => <div className="file-tab-shell" key={analysis.id}><button className={selected?.analysis.id === analysis.id ? "file-tab active" : "file-tab"} onClick={() => setSelectedId(analysis.id)}><i className={analysis.status} /> <span>{analysis.fileName}</span><b>{ppiLabel(analysis)}</b></button><button className="file-remove" type="button" onClick={() => removeFile(analysis.id)} aria-label={`Eliminar ${analysis.fileName}`} title="Eliminar archivo">×</button></div>)}
           </nav>
 
-          {selected && <FileDetail analysis={selected.analysis} targetPpi={PROFILES[profile].dpi} />}
+          {selected && <FileDetail file={selected.file} analysis={selected.analysis} targetPpi={PROFILES[profile].dpi} />}
           {items.length > 1 && <Comparison items={items} />}
 
           <section className="rip-checklist"><div><p className="kicker">DECISIÓN DE PRODUCCIÓN</p><h2>Compatibilidad y calidad no son lo mismo</h2><p>Un archivo puede abrir en el RIP y tener mala resolución; también puede verse perfecto y contener capas, XFA o filtros que el RIP instalado no interpreta. Por eso ahora se informan por separado y sin puntuación artificial.</p></div><ol><li><span>1</span><div><b>Compatibilidad RIP</b><small>Estructura y funciones PDF de riesgo</small></div></li><li><span>2</span><div><b>Calidad de impresión</b><small>PPI, perfil, color y sobreimpresión</small></div></li><li><span>3</span><div><b>Espejo una sola vez</b><small>En el archivo o en el RIP</small></div></li><li><span>4</span><div><b>Prueba física</b><small>Confirma color y transferencia</small></div></li></ol></section>
@@ -756,18 +756,52 @@ export function PreflightApp() {
   );
 }
 
-function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: number }) {
+function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analysis; targetPpi: number }) {
   const [selectedColor, setSelectedColor] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [eyedropper, setEyedropper] = useState(false);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [pageRatio, setPageRatio] = useState(1 / 1.414);
   const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number; hex: string; distance: number | null } | null>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const sampleImageRef = useRef<HTMLImageElement>(null);
   const activeColor = analysis.sourceColors.find((color) => color.id === selectedColor) || analysis.sourceColors[0] || null;
   const currentSample = sampledPoint?.analysisId === analysis.id ? sampledPoint : null;
   const changeZoom = (amount: number) => setZoom((current) => Math.min(4, Math.max(0.5, Number((current + amount).toFixed(2)))));
-  const samplePreview = (event: ReactMouseEvent<HTMLImageElement>) => {
+
+  useEffect(() => {
+    const url = URL.createObjectURL(new Blob([file], { type: "application/pdf" }));
+    setPdfUrl(url);
+    setZoom(1);
+    setEyedropper(false);
+    setSampledPoint(null);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  const zoomWithWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const stage = stageRef.current;
+    if (!stage || !pdfUrl) return;
+    const next = Math.min(4, Math.max(0.5, Number((zoom + (event.deltaY < 0 ? 0.15 : -0.15)).toFixed(2))));
+    if (next === zoom) return;
+    const bounds = stage.getBoundingClientRect();
+    const localX = event.clientX - bounds.left;
+    const localY = event.clientY - bounds.top;
+    const contentX = stage.scrollLeft + localX;
+    const contentY = stage.scrollTop + localY;
+    const ratio = next / zoom;
+    setZoom(next);
+    requestAnimationFrame(() => {
+      stage.scrollLeft = contentX * ratio - localX;
+      stage.scrollTop = contentY * ratio - localY;
+    });
+  };
+
+  const samplePreview = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!eyedropper) return;
-    const image = event.currentTarget;
-    const bounds = image.getBoundingClientRect();
+    const image = sampleImageRef.current;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (!image) return;
     if (!bounds.width || !bounds.height || !image.naturalWidth || !image.naturalHeight) return;
     const x = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
     const y = Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height));
@@ -797,9 +831,10 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
   };
   return <section className="file-detail">
     <div className="visual-column">
-      <div className="detail-heading"><span>Vista real · primera página</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
-      <div className="preview-toolbar" aria-label="Controles de la vista real"><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
-      <div className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"}>{analysis.thumbnail ? <div className="zoom-surface" style={{ width: `${zoom * 100}%` }}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} onClick={samplePreview} draggable={false} />{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación visual compatible.</p></div>}</div>
+      <div className="detail-heading"><span>Vista vectorial · PDF original</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
+      <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda del mouse sobre la vista para acercar o alejar</span><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
+      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"} onWheel={zoomWithWheel}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><div className="vector-interaction-layer" onClick={samplePreview} aria-label={eyedropper ? "Seleccionar un punto de color" : "Vista vectorial del PDF original"} />{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
+      {analysis.thumbnail && <img ref={sampleImageRef} className="sampling-source" src={analysis.thumbnail} alt="" aria-hidden="true" onLoad={(event) => setPageRatio(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />}
       <div className="color-readout"><span>COLORES REALES DEL ARCHIVO</span><div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? "Haz clic sobre cualquier punto de la vista real." : "Actívalo para inspeccionar un punto del diseño."}</small></div><div className="color-swatches">{analysis.sourceColors.length ? analysis.sourceColors.map((color) => <button key={color.id} className={activeColor?.id === color.id ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color.preview }} onClick={() => { setSelectedColor(color.id); setSampledPoint(null); }} aria-label={`Mostrar ${color.space}: ${sourceColorValues(color)}`} aria-pressed={activeColor?.id === color.id} title={`${color.space} · ${sourceColorValues(color)}`} />) : <small>No se encontraron colores vectoriales extraíbles.</small>}</div>{currentSample && <div className="sample-result"><span className="sample-chip" style={{ backgroundColor: currentSample.hex }} /><div><span>PUNTO MUESTREADO</span><b>{currentSample.hex} · RGB visible</b></div><small>{activeColor ? "Vinculado al color original más cercano" : "Sin color original extraíble para vincular"}</small></div>}{activeColor && <div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>VISTA APROX.</span><b>{activeColor.preview}</b></div></div>}<small>{currentSample ? "El cuentagotas usa la vista para localizar el punto y muestra la composición original más cercana del PDF. Los porcentajes y el perfil provienen del archivo." : "Valores leídos directamente de los operadores del PDF. La muestra visual es aproximada; los porcentajes y el perfil son los datos originales."}</small></div>
     </div>
     <div className="technical-column">
