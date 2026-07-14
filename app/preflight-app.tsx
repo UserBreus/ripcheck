@@ -524,6 +524,23 @@ function resourceIntegrityLabel(analysis: Analysis) {
     : "Recursos coherentes";
 }
 
+function colorComposition(hex: string) {
+  const normalized = hex.replace("#", "");
+  const r = Number.parseInt(normalized.slice(0, 2), 16);
+  const g = Number.parseInt(normalized.slice(2, 4), 16);
+  const b = Number.parseInt(normalized.slice(4, 6), 16);
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const k = 1 - Math.max(red, green, blue);
+  const divisor = 1 - k;
+  const c = divisor === 0 ? 0 : (1 - red - k) / divisor;
+  const m = divisor === 0 ? 0 : (1 - green - k) / divisor;
+  const y = divisor === 0 ? 0 : (1 - blue - k) / divisor;
+  const percent = (value: number) => Math.round(Math.max(0, Math.min(1, value)) * 100);
+  return { hex: `#${normalized.toUpperCase()}`, rgb: [r, g, b], cmyk: [percent(c), percent(m), percent(y), percent(k)] };
+}
+
 function qualityLabel(status: Status) {
   return status === "ready" ? "CALIDAD APROBADA" : status === "caution" ? "CALIDAD A REVISAR" : "CALIDAD INSUFICIENTE";
 }
@@ -710,6 +727,9 @@ export function PreflightApp() {
 }
 
 function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: number }) {
+  const [selectedColor, setSelectedColor] = useState<string | null>(null);
+  const activeColor = selectedColor && analysis.dominantColors.includes(selectedColor) ? selectedColor : analysis.dominantColors[0] || null;
+  const composition = activeColor ? colorComposition(activeColor) : null;
   const groups = {
     ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
     ripWarnings: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "warning"),
@@ -721,7 +741,7 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
     <div className="visual-column">
       <div className="detail-heading"><span>Vista real · primera página</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
       <div className="thumb-stage">{analysis.thumbnail ? <img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación visual compatible.</p></div>}</div>
-      <div className="color-readout"><span>COLORES VISUALES DETECTADOS</span><div>{analysis.dominantColors.length ? analysis.dominantColors.map((color) => <i key={color} style={{ backgroundColor: color }} title={color} />) : <small>No concluyente</small>}</div><small>Colores dominantes renderizados de la primera página</small></div>
+      <div className="color-readout"><span>COLORES VISUALES DETECTADOS</span><div className="color-swatches">{analysis.dominantColors.length ? analysis.dominantColors.map((color) => <button key={color} className={activeColor === color ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color }} onClick={() => setSelectedColor(color)} aria-label={`Mostrar composición de ${color}`} aria-pressed={activeColor === color} title={`Ver composición de ${color}`} />) : <small>No concluyente</small>}</div>{composition && <div className="color-composition"><div><span>HEX</span><b>{composition.hex}</b></div><div><span>RGB</span><b>{composition.rgb.join(" · ")}</b></div><div><span>CMYK</span><b>{composition.cmyk.map((value) => `${value}%`).join(" · ")}</b></div></div>}<small>Presiona un color para ver su composición. CMYK es una conversión aproximada del color visible renderizado.</small></div>
     </div>
     <div className="technical-column">
       <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>

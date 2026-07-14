@@ -235,8 +235,17 @@ button { color: inherit; }
 .thumb-stage img { display: block; max-width: 100%; max-height: 68vh; object-fit: contain; box-shadow: 0 8px 25px rgba(23,32,27,.18); }
 .color-readout { padding: 14px 2px 0; }
 .color-readout > span { display: block; margin-bottom: 9px; color: var(--muted); font-family: var(--font-plex-mono), monospace; font-size: 8px; letter-spacing: .7px; }
-.color-readout > div { display: flex; gap: 5px; margin-bottom: 7px; }
-.color-readout i { width: 29px; height: 29px; display: block; border: 1px solid rgba(23,32,27,.18); border-radius: 2px; }
+.color-swatches { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.color-swatch { width: 32px; height: 32px; display: block; padding: 0; border: 1px solid rgba(23,32,27,.22); border-radius: 3px; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }
+.color-swatch:hover { transform: translateY(-2px); }
+.color-swatch.active { box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--ink); }
+.color-swatch:focus-visible { outline: 3px solid var(--lime); outline-offset: 2px; }
+.color-composition { display: grid; grid-template-columns: .75fr 1fr 1.45fr; margin: 0 0 9px; overflow: hidden; border: 1px solid var(--line); border-radius: 3px; background: var(--card); }
+.color-composition > div { min-width: 0; padding: 10px 11px; border-right: 1px solid var(--line); }
+.color-composition > div:last-child { border-right: 0; }
+.color-composition span, .color-composition b { display: block; }
+.color-composition span { margin-bottom: 4px; color: var(--muted); font-family: var(--font-plex-mono), monospace; font-size: 7px; letter-spacing: .7px; }
+.color-composition b { overflow: hidden; font-family: var(--font-plex-mono), monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .color-readout > small { color: var(--muted); font-size: 9px; }
 .technical-column { padding: 18px; }
 .single-status { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding: 14px 16px; border-radius: 3px; font-family: var(--font-plex-mono), monospace; font-size: 10px; font-weight: 700; letter-spacing: .6px; }
