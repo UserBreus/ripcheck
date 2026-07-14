@@ -1,6 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import { decodedContentStreams, inspectPdfStructure, type LayerState } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
 type Status = "ready" | "caution" | "blocked";
@@ -35,6 +36,11 @@ type Analysis = {
   textCharacters: number;
   textPreview: string;
   metadata: Metadata;
+  layerCount: number;
+  layerState: LayerState;
+  missingFontResources: string[];
+  formXObjectCount: number;
+  iccProfileCount: number;
   thumbnail: string | null;
   visualHash: string | null;
   fileHash: string;
@@ -95,67 +101,6 @@ function validateCrossReference(bytes: Uint8Array) {
   }
   const trailingBytes = eofIndex >= 0 ? tail.length - (eofIndex + 5) : Number.POSITIVE_INFINITY;
   return { hasEof: eofIndex >= 0, hasStartXref: offset >= 0, xrefValid, trailingBytes };
-}
-
-function decodeAscii85(source: Uint8Array) {
-  const input = new TextDecoder("latin1").decode(source).replace(/\s+/g, "").replace(/^<~/, "").replace(/~>[\s\S]*$/, "");
-  const output: number[] = [];
-  let group: number[] = [];
-  const flush = (final = false) => {
-    if (!group.length) return;
-    const originalLength = group.length;
-    while (group.length < 5) group.push(84);
-    let value = 0;
-    for (const digit of group) value = value * 85 + digit;
-    const decoded = [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
-    output.push(...decoded.slice(0, final ? Math.max(0, originalLength - 1) : 4));
-    group = [];
-  };
-  for (const character of input) {
-    if (character === "z" && group.length === 0) output.push(0, 0, 0, 0);
-    else {
-      const digit = character.charCodeAt(0) - 33;
-      if (digit < 0 || digit > 84) continue;
-      group.push(digit);
-      if (group.length === 5) flush();
-    }
-  }
-  flush(true);
-  return new Uint8Array(output);
-}
-
-async function decodedContentStreams(bytes: Uint8Array, raw: string) {
-  if (bytes.byteLength > 80 * 1024 * 1024) return "";
-  const decoder = new TextDecoder("latin1");
-  const parts: string[] = [];
-  const streamPattern = /(?<!end)stream\r?\n/g;
-  let match: RegExpExecArray | null;
-  let inspected = 0;
-  while ((match = streamPattern.exec(raw)) && inspected < 250) {
-    const start = match.index + match[0].length;
-    const dictionary = raw.slice(Math.max(0, match.index - 1400), match.index);
-    if (/\/Subtype\s*\/Image|\/FontFile\d?\b|\/DestOutputProfile\b/.test(dictionary)) continue;
-    const endMarker = raw.indexOf("endstream", start);
-    if (endMarker < 0) continue;
-    const directLength = dictionary.match(/\/Length\s+(\d+)\s*(?:>>|\/)/)?.[1];
-    const end = directLength ? Math.min(bytes.length, start + Number(directLength)) : endMarker;
-    if (end <= start || end - start > 8 * 1024 * 1024) continue;
-    inspected += 1;
-    let source = bytes.slice(start, end);
-    try {
-      if (/\/ASCII85Decode\b/.test(dictionary)) source = decodeAscii85(source);
-      if (/\/FlateDecode\b/.test(dictionary) && typeof DecompressionStream !== "undefined") {
-        const stream = new Blob([source]).stream().pipeThrough(new DecompressionStream("deflate"));
-        const inflated = new Uint8Array(await new Response(stream).arrayBuffer());
-        parts.push(decoder.decode(inflated));
-      } else if ((!/\/Filter\b/.test(dictionary) || /\/ASCII85Decode\b/.test(dictionary)) && source.length < 1024 * 1024) {
-        parts.push(decoder.decode(source));
-      }
-    } catch {
-      // A stream can combine filters or use an indirect length. PDF.js still analyzes it.
-    }
-  }
-  return parts.join("\n");
 }
 
 function uniqueMatches(text: string, pattern: RegExp, limit = 24) {
@@ -294,6 +239,11 @@ function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
     textCharacters: 0,
     textPreview: "",
     metadata: { title: "", author: "", creator: "", producer: "", created: "" },
+    layerCount: 0,
+    layerState: "unknown",
+    missingFontResources: [],
+    formXObjectCount: 0,
+    iccProfileCount: 0,
     thumbnail: null,
     visualHash: null,
     fileHash,
@@ -329,6 +279,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const contentText = await decodedContentStreams(bytes, raw);
   const inspectionText = `${raw}\n${contentText}`;
   const crossReference = validateCrossReference(bytes);
+  const pdfStructure = inspectPdfStructure(raw, contentText);
 
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -463,6 +414,18 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
 
   const rawFontCount = Array.from(raw.matchAll(/\/BaseFont\s*\//g)).length;
   const embeddedFontCount = Array.from(raw.matchAll(/\/FontFile\d?\s+/g)).length;
+  if (pdfStructure.missingFontResources.length) {
+    checks.push({
+      id: "font-resources",
+      title: `Referencias tipográficas rotas: ${pdfStructure.missingFontResources.join(", ")}`,
+      detail: "El contenido intenta usar estas fuentes, pero no están declaradas en los recursos PDF. Los visores tolerantes pueden omitir el error; PhotoPRINT puede rechazar el archivo.",
+      severity: "error",
+      value: "NO APTO",
+      scope: "rip",
+    });
+  } else if (contentText.match(/\/[^\s/<>{}\[\]()]+\s+[-+]?(?:\d*\.)?\d+\s+Tf\b/)) {
+    checks.push({ id: "font-resources", title: "Recursos tipográficos coherentes", detail: "Las fuentes utilizadas por las instrucciones de texto están declaradas en los recursos del PDF.", severity: "pass", value: "CORRECTO", scope: "rip" });
+  }
   checks.push({
     id: "fonts",
     title: hasText ? `${fontNames.size || rawFontCount} fuente${(fontNames.size || rawFontCount) === 1 ? "" : "s"} en texto` : "No contiene texto editable detectable",
@@ -479,7 +442,6 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
 
   const hasXfa = /\/XFA\b/.test(inspectionText);
   const hasInteractive = /\/(?:RichMedia|3D|JavaScript|Launch|EmbeddedFile)\b/.test(inspectionText);
-  const hasLayers = /\/OCProperties\b|\/Type\s*\/OCG\b/.test(inspectionText);
   const hasJpeg2000 = /\/JPXDecode\b/.test(inspectionText);
   const hasComplexBlend = /\/BM\s*\/(?!Normal\b)[A-Za-z]+/.test(inspectionText);
   const hasOverprint = /\/(?:OP|op)\s+true\b|\/OPM\s+[12]\b/.test(inspectionText);
@@ -487,7 +449,12 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
 
   if (hasXfa) checks.push({ id: "xfa", title: "Formulario XFA detectado", detail: "XFA no es contenido de página PDF convencional y puede no existir para el intérprete del RIP. Imprime o aplana el archivo a un PDF nuevo antes de producción.", severity: "error", value: "APLANAR", scope: "rip" });
   if (hasInteractive) checks.push({ id: "interactive", title: "Contenido interactivo o adjunto", detail: "Se detectaron elementos no orientados a impresión. El RIP puede ignorarlos o rechazar el documento; aplana una copia de producción.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
-  if (hasLayers) checks.push({ id: "layers", title: "Capas PDF opcionales", detail: "El resultado depende del estado de visibilidad de las capas. Aplana una copia para asegurar que el RIP reciba exactamente lo visible.", severity: "warning", value: "APLANAR", scope: "rip" });
+  if (pdfStructure.layerState === "orphaned") checks.push({ id: "layers", title: `${pdfStructure.layerCount} capas OCG huérfanas`, detail: "El PDF contiene capas opcionales, pero el catálogo principal no tiene OCProperties para registrarlas. Esta inconsistencia fue confirmada en archivos rechazados por PhotoPRINT.", severity: "error", value: "NO APTO", scope: "rip" });
+  else if (pdfStructure.layerState === "registered") checks.push({ id: "layers", title: `${pdfStructure.layerCount} capa${pdfStructure.layerCount === 1 ? "" : "s"} PDF correctamente registrada${pdfStructure.layerCount === 1 ? "" : "s"}`, detail: "Las capas OCG están declaradas en el catálogo del documento. Su sola presencia no impide el ripeo.", severity: "pass", value: "CORRECTO", scope: "rip" });
+  else if (pdfStructure.layerState === "none") checks.push({ id: "layers", title: "Sin capas PDF opcionales", detail: "No se detectaron grupos de contenido opcional OCG; el contenido está aplanado respecto de capas PDF.", severity: "pass", value: "APLANADO", scope: "rip" });
+  else checks.push({ id: "layers", title: "Registro de capas no concluyente", detail: "La estructura comprimida no permite confirmar el registro de todas las capas sin reescribir el documento.", severity: "info", value: "NO CONCLUYENTE", scope: "info" });
+  if (pdfStructure.formXObjectCount > 10) checks.push({ id: "forms", title: `${pdfStructure.formXObjectCount} formularios gráficos internos`, detail: "No es un bloqueo por sí solo, pero explica una estructura más compleja que la versión aplanada y se incluye para comparar archivos similares.", severity: "info", value: `${pdfStructure.formXObjectCount} Form XObjects`, scope: "info" });
+  if (pdfStructure.iccProfileCount > 1) checks.push({ id: "icc-duplicates", title: `${pdfStructure.iccProfileCount} referencias ICC internas`, detail: "El archivo repite perfiles de color en distintos recursos. No se rechaza solo por esto, pero aumenta el tamaño y la complejidad interna.", severity: "info", value: `${pdfStructure.iccProfileCount} ICC`, scope: "info" });
   if (hasJpeg2000) checks.push({ id: "jpx", title: "Imágenes JPEG 2000", detail: "El filtro JPXDecode no está soportado por todos los intérpretes RIP. Convierte esas imágenes a TIFF/ZIP o JPEG convencional si PhotoPRINT no abre el archivo.", severity: "warning", value: "COMPATIBILIDAD", scope: "rip" });
   if (hasComplexBlend) checks.push({ id: "blend", title: "Modos de fusión avanzados", detail: "Se detectaron modos distintos de Normal. La apariencia puede cambiar o fallar al rasterizar; prueba o aplana transparencias.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
   if (hasOverprint) checks.push({ id: "overprint", title: "Sobreimpresión activa", detail: "La sobreimpresión puede producir un resultado diferente si el RIP no respeta la configuración. Verifica separaciones y simulación de sobreimpresión.", severity: "warning", value: "REVISAR", scope: "quality" });
@@ -528,6 +495,11 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     textCharacters,
     textPreview: collectedText.trim().slice(0, 260),
     metadata,
+    layerCount: pdfStructure.layerCount,
+    layerState: pdfStructure.layerState,
+    missingFontResources: pdfStructure.missingFontResources,
+    formXObjectCount: pdfStructure.formXObjectCount,
+    iccProfileCount: pdfStructure.iccProfileCount,
     thumbnail,
     visualHash,
     fileHash,
@@ -536,7 +508,20 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
 }
 
 function statusLabel(status: Status) {
-  return status === "ready" ? "APTO PROBABLE PARA RIP" : status === "caution" ? "PRUEBA RIP OBLIGATORIA" : "NO APTO PARA RIP";
+  return status === "ready" ? "APTO PARA RIP" : status === "caution" ? "RIESGO DE COMPATIBILIDAD" : "NO APTO PARA RIP";
+}
+
+function layerLabel(analysis: Analysis) {
+  if (analysis.layerState === "none") return "Sin capas · aplanado";
+  if (analysis.layerState === "registered") return `${analysis.layerCount} · registradas correctamente`;
+  if (analysis.layerState === "orphaned") return `${analysis.layerCount} · OCG huérfanas`;
+  return "No concluyente";
+}
+
+function resourceIntegrityLabel(analysis: Analysis) {
+  return analysis.missingFontResources.length
+    ? `Fuentes faltantes: ${analysis.missingFontResources.join(", ")}`
+    : "Recursos coherentes";
 }
 
 function qualityLabel(status: Status) {
@@ -694,7 +679,7 @@ export function PreflightApp() {
 
           <div className={`batch-banner ${batchStatus}`}>
             <div><p className="result-label">COMPATIBILIDAD DEL LOTE</p><h1>{batchStatus === "blocked" ? `${summary.blocked} archivo${summary.blocked === 1 ? " no es interpretable" : "s no son interpretables"}` : batchStatus === "caution" ? "Hay archivos que exigen prueba en RIP" : "Sin bloqueos RIP detectados"}</h1><p>{items.length} archivo{items.length === 1 ? "" : "s"} comparado{items.length === 1 ? "" : "s"}. La calidad se informa por separado para no confundir resolución/color con compatibilidad.</p></div>
-            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Aptos probables</span><span className="count-caution"><b>{summary.caution}</b>Prueba obligatoria</span><span className="count-blocked"><b>{summary.blocked}</b>No aptos</span></div>
+            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Aptos</span><span className="count-caution"><b>{summary.caution}</b>Con riesgo</span><span className="count-blocked"><b>{summary.blocked}</b>No aptos</span></div>
           </div>
 
           {working && <div className="inline-progress"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /><p>Analizando {progress.name} · {progress.done}/{progress.total}</p></div>}
@@ -737,6 +722,8 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
         <Metric label="TEXTO" value={analysis.hasText ? "Sí contiene" : "No detectado"} hint={analysis.hasText ? `${analysis.textCharacters.toLocaleString("es-UY")} caracteres` : "Puede estar trazado"} />
         <Metric label="PÁGINAS" value={String(analysis.pages ?? "—")} hint={analysis.dimensions.join(" · ") || "Sin tamaño legible"} />
         <Metric label="IMÁGENES RÁSTER" value={String(analysis.imageCount)} hint={`${analysis.ppiPlacements} colocaciones medibles`} />
+        <Metric label="CAPAS PDF" value={layerLabel(analysis)} hint="Registro OCG del documento" tone={analysis.layerState === "orphaned" ? "bad" : analysis.layerState === "unknown" ? "warn" : "good"} />
+        <Metric label="RECURSOS INTERNOS" value={resourceIntegrityLabel(analysis)} hint={`${analysis.formXObjectCount} formularios · ${analysis.iccProfileCount} ICC`} tone={analysis.missingFontResources.length ? "bad" : "good"} />
       </div>
       {analysis.spotColors.length > 0 && <div className="spot-line"><span>Tintas directas</span><b>{analysis.spotColors.join(" · ")}</b></div>}
       {analysis.hasText && <div className="text-sample"><span>TEXTO DETECTADO</span><p>{analysis.textPreview || "Texto presente sin contenido extraíble."}</p><small>{analysis.fontNames.length ? `Fuentes: ${analysis.fontNames.join(", ")}` : "Fuentes sin nombre legible"}</small></div>}
@@ -759,6 +746,10 @@ function Comparison({ items }: { items: BatchItem[] }) {
     { label: "Espacios de color", get: (a: Analysis) => a.colorSpaces.join(" + ") || "No concluyente" },
     { label: "Colores dominantes", get: (a: Analysis) => a.dominantColors.join(" · ") || "—" },
     { label: "Texto", get: (a: Analysis) => a.hasText ? `Sí · ${a.textCharacters} caracteres` : "No detectado" },
+    { label: "Integridad de recursos", get: resourceIntegrityLabel },
+    { label: "Capas PDF", get: layerLabel },
+    { label: "Formularios gráficos", get: (a: Analysis) => String(a.formXObjectCount) },
+    { label: "Referencias ICC", get: (a: Analysis) => String(a.iccProfileCount) },
     { label: "Páginas", get: (a: Analysis) => String(a.pages ?? "—") },
     { label: "Tamaño de página", get: (a: Analysis) => a.dimensions.join(" / ") || "—" },
     { label: "Creador / productor", get: (a: Analysis) => [a.metadata.creator, a.metadata.producer].filter(Boolean).join(" / ") || "No declarado" },
