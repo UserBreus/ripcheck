@@ -10,7 +10,16 @@ type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
 type Check = { id: string; title: string; detail: string; severity: Severity; value?: string; scope?: "rip" | "quality" | "info" };
 type Metadata = { title: string; author: string; creator: string; producer: string; created: string };
-type PdfPaintRegion = { colorId: string; x1: number; y1: number; x2: number; y2: number; paint: "fill" | "stroke"; area: number; order: number };
+type PdfPaintRegion = {
+  id: string;
+  colorId: string | null;
+  kind: "vector" | "text" | "raster";
+  d: string;
+  paint: "fill" | "stroke";
+  fillRule: "nonzero" | "evenodd";
+  strokeWidth: number;
+  order: number;
+};
 
 type Analysis = {
   id: string;
@@ -173,8 +182,8 @@ function paintRegions(
   viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): [number, number] },
   sourceColors: PdfSourceColor[],
 ) {
-  type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null };
-  let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null };
+  type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null; lineWidth: number; textMatrix: Matrix; fontSize: number };
+  let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null, lineWidth: 1, textMatrix: [...IDENTITY], fontSize: 12 };
   const stack: PaintState[] = [];
   const regions: PdfPaintRegion[] = [];
 
@@ -182,47 +191,94 @@ function paintRegions(
     const hex = typeof args[0] === "string" && /^#[0-9a-f]{6}$/i.test(args[0]) ? args[0] : null;
     return hex ? nearestSourceColor(sourceColors, hex)?.color.id || null : null;
   };
-  const transformedBounds = (bounds: ArrayLike<number>) => {
-    if (bounds.length < 4) return null;
-    const [x1, y1, x2, y2] = Array.from({ length: 4 }, (_, index) => Number(bounds[index]));
-    if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
-    const points = [[x1, y1], [x1, y2], [x2, y1], [x2, y2]].map(([x, y]) => {
-      const transformedX = state.ctm[0] * x + state.ctm[2] * y + state.ctm[4];
-      const transformedY = state.ctm[1] * x + state.ctm[3] * y + state.ctm[5];
-      return viewport.convertToViewportPoint(transformedX, transformedY);
-    });
-    const xs = points.map((point) => point[0] / viewport.width);
-    const ys = points.map((point) => point[1] / viewport.height);
-    return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+  const matrixFrom = (value: unknown): Matrix | null => {
+    const matrix = value as ArrayLike<number> | null;
+    if (!matrix || typeof matrix.length !== "number" || matrix.length < 6) return null;
+    const numbers = Array.from({ length: 6 }, (_, index) => Number(matrix[index])) as Matrix;
+    return numbers.every(Number.isFinite) ? numbers : null;
   };
-  const addRegion = (bounds: ArrayLike<number>, colorId: string | null, paint: PdfPaintRegion["paint"]) => {
-    if (!colorId || regions.length >= 6000) return;
-    const normalized = transformedBounds(bounds);
-    if (!normalized || normalized.x2 < 0 || normalized.y2 < 0 || normalized.x1 > 1 || normalized.y1 > 1) return;
-    const x1 = Math.max(0, normalized.x1);
-    const y1 = Math.max(0, normalized.y1);
-    const x2 = Math.min(1, normalized.x2);
-    const y2 = Math.min(1, normalized.y2);
-    regions.push({ colorId, x1, y1, x2, y2, paint, area: Math.max(0, (x2 - x1) * (y2 - y1)), order: regions.length });
+  const project = (x: number, y: number, matrix: Matrix = state.ctm) => {
+    const transformedX = matrix[0] * x + matrix[2] * y + matrix[4];
+    const transformedY = matrix[1] * x + matrix[3] * y + matrix[5];
+    const point = viewport.convertToViewportPoint(transformedX, transformedY);
+    return [point[0] / viewport.width, point[1] / viewport.height] as const;
+  };
+  const format = (number: number) => Number(number.toFixed(6));
+  const pathFromEncoded = (encoded: ArrayLike<number>) => {
+    let index = 0;
+    const commands: string[] = [];
+    while (index < encoded.length) {
+      const operation = Number(encoded[index++]);
+      if (operation === 0 || operation === 1) {
+        const point = project(Number(encoded[index++]), Number(encoded[index++]));
+        commands.push(`${operation === 0 ? "M" : "L"}${format(point[0])} ${format(point[1])}`);
+      } else if (operation === 2) {
+        const first = project(Number(encoded[index++]), Number(encoded[index++]));
+        const second = project(Number(encoded[index++]), Number(encoded[index++]));
+        const end = project(Number(encoded[index++]), Number(encoded[index++]));
+        commands.push(`C${format(first[0])} ${format(first[1])} ${format(second[0])} ${format(second[1])} ${format(end[0])} ${format(end[1])}`);
+      } else if (operation === 3) commands.push("Z");
+      else break;
+    }
+    return commands.join(" ");
+  };
+  const polygon = (points: Array<[number, number]>, matrix: Matrix = state.ctm) => points.map(([x, y], index) => {
+    const point = project(x, y, matrix);
+    return `${index ? "L" : "M"}${format(point[0])} ${format(point[1])}`;
+  }).join(" ") + " Z";
+  const normalizedLineWidth = () => {
+    const origin = project(0, 0);
+    const horizontal = project(state.lineWidth, 0);
+    const vertical = project(0, state.lineWidth);
+    return Math.max(Math.hypot(horizontal[0] - origin[0], horizontal[1] - origin[1]), Math.hypot(vertical[0] - origin[0], vertical[1] - origin[1]), 0.0015);
+  };
+  const addRegion = (d: string, colorId: string | null, kind: PdfPaintRegion["kind"], paint: PdfPaintRegion["paint"], fillRule: PdfPaintRegion["fillRule"] = "nonzero") => {
+    if (!d || regions.length >= 10000) return;
+    regions.push({ id: `${kind}-${regions.length}`, colorId, kind, d, paint, fillRule, strokeWidth: paint === "stroke" ? normalizedLineWidth() : 0, order: regions.length });
   };
 
   operatorList.fnArray.forEach((fn, index) => {
     const args = operatorList.argsArray[index] || [];
-    if (fn === OPS.save) stack.push({ ...state, ctm: [...state.ctm] });
+    if (fn === OPS.save) stack.push({ ...state, ctm: [...state.ctm], textMatrix: [...state.textMatrix] });
     else if (fn === OPS.restore) state = stack.pop() || state;
     else if (fn === OPS.transform && args.length >= 6) state.ctm = multiply(state.ctm, args.slice(0, 6).map(Number) as Matrix);
-    else if (fn === OPS.paintFormXObjectBegin && Array.isArray(args[0]) && args[0].length >= 6) {
-      stack.push({ ...state, ctm: [...state.ctm] });
-      state.ctm = multiply(state.ctm, args[0].slice(0, 6).map(Number) as Matrix);
+    else if (fn === OPS.paintFormXObjectBegin && matrixFrom(args[0])) {
+      stack.push({ ...state, ctm: [...state.ctm], textMatrix: [...state.textMatrix] });
+      state.ctm = multiply(state.ctm, matrixFrom(args[0])!);
     } else if (fn === OPS.paintFormXObjectEnd) state = stack.pop() || state;
+    else if (fn === OPS.setLineWidth) state.lineWidth = Math.max(0, Number(args[0]) || 0);
     else if (fn === OPS.setFillRGBColor || fn === OPS.setFillCMYKColor || fn === OPS.setFillGray || fn === OPS.setFillColor || fn === OPS.setFillColorN) state.fillColorId = colorIdFromArgs(args);
     else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeCMYKColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeColor || fn === OPS.setStrokeColorN) state.strokeColorId = colorIdFromArgs(args);
+    else if (fn === OPS.setFillTransparent) state.fillColorId = null;
+    else if (fn === OPS.setStrokeTransparent) state.strokeColorId = null;
+    else if (fn === OPS.beginText) state.textMatrix = [...IDENTITY];
+    else if (fn === OPS.setTextMatrix) state.textMatrix = matrixFrom(args[0]) || (args.length >= 6 ? args.slice(0, 6).map(Number) as Matrix : state.textMatrix);
+    else if (fn === OPS.setFont) state.fontSize = Math.abs(Number(args[1]) || state.fontSize);
+    else if (fn === OPS.moveText || fn === OPS.setLeadingMoveText) {
+      state.textMatrix[4] += Number(args[0]) || 0;
+      state.textMatrix[5] += Number(args[1]) || 0;
+    }
     else if (fn === OPS.constructPath) {
       const paint = Number(args[0]);
-      const bounds = args[2] as ArrayLike<number> | undefined;
-      if (!bounds) return;
-      if ([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(bounds, state.fillColorId, "fill");
-      if ([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(bounds, state.strokeColorId, "stroke");
+      const data = args[1] as ArrayLike<ArrayLike<number>> | undefined;
+      const d = data?.[0] ? pathFromEncoded(data[0]) : "";
+      const evenOdd = [OPS.eoFill, OPS.eoFillStroke, OPS.closeEOFillStroke].includes(paint);
+      if ([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(d, state.fillColorId, "vector", "fill", evenOdd ? "evenodd" : "nonzero");
+      if ([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(d, state.strokeColorId, "vector", "stroke");
+    } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject || fn === OPS.paintSolidColorImageMask) {
+      addRegion(polygon([[0, 0], [1, 0], [1, 1], [0, 1]]), null, "raster", "fill");
+    } else if (fn === OPS.showText || fn === OPS.showSpacedText || fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
+      const glyphs = Array.isArray(args[0]) ? args[0] : [];
+      let advance = 0;
+      for (const glyph of glyphs) {
+        if (typeof glyph === "number") advance += (-glyph / 1000) * state.fontSize;
+        else if (glyph && typeof glyph === "object" && "width" in glyph) advance += (Number((glyph as { width: number }).width) / 1000) * state.fontSize;
+      }
+      const textTransform = multiply(state.ctm, state.textMatrix);
+      const d = polygon([[0, -state.fontSize * 0.25], [advance, -state.fontSize * 0.25], [advance, state.fontSize * 0.85], [0, state.fontSize * 0.85]], textTransform);
+      addRegion(d, state.fillColorId, "text", "fill");
+      state.textMatrix[4] += state.textMatrix[0] * advance;
+      state.textMatrix[5] += state.textMatrix[1] * advance;
     }
   });
   return regions;
@@ -403,11 +459,11 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     ppiValues.push(...imageResult.values);
 
     if (pageNumber === 1) {
+      firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, sourceColors);
       const rendered = await renderFirstPage(page);
       thumbnail = rendered.thumbnail;
       visualHash = rendered.visualHash;
       detectedColors = rendered.colors;
-      firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, sourceColors);
     }
     page.cleanup();
   }
@@ -829,7 +885,7 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
   const [eyedropper, setEyedropper] = useState(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [pageRatio, setPageRatio] = useState(1 / 1.414);
-  const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number } | null>(null);
+  const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number; kind: PdfPaintRegion["kind"] | "empty"; objectId: string | null } | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const sampleImageRef = useRef<HTMLImageElement>(null);
   const activeColor = analysis.sourceColors.find((color) => color.id === selectedColorId) || null;
@@ -865,20 +921,25 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
     });
   };
 
-  const samplePreview = (event: ReactMouseEvent<HTMLDivElement>) => {
+  const sampledCoordinates = (event: ReactMouseEvent<SVGElement>) => {
+    const bounds = event.currentTarget.ownerSVGElement?.getBoundingClientRect() || event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)),
+      y: Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height)),
+    };
+  };
+  const selectVectorObject = (event: ReactMouseEvent<SVGPathElement>, object: PdfPaintRegion) => {
     if (!eyedropper) return;
-    const bounds = event.currentTarget.getBoundingClientRect();
-    if (!bounds.width || !bounds.height) return;
-    const x = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
-    const y = Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height));
-    const hits = analysis.paintRegions
-      .filter((region) => {
-        const tolerance = region.paint === "stroke" ? 0.012 : 0;
-        return x >= region.x1 - tolerance && x <= region.x2 + tolerance && y >= region.y1 - tolerance && y <= region.y2 + tolerance;
-      })
-      .sort((a, b) => a.area - b.area || b.order - a.order);
-    setSelectedColorId(hits[0]?.colorId || null);
-    setSampledPoint({ analysisId: analysis.id, x, y });
+    event.stopPropagation();
+    const { x, y } = sampledCoordinates(event);
+    setSelectedColorId(object.colorId);
+    setSampledPoint({ analysisId: analysis.id, x, y, kind: object.kind, objectId: object.id });
+  };
+  const selectEmptyPoint = (event: ReactMouseEvent<SVGSVGElement>) => {
+    if (!eyedropper) return;
+    const { x, y } = sampledCoordinates(event);
+    setSelectedColorId(null);
+    setSampledPoint({ analysisId: analysis.id, x, y, kind: "empty", objectId: null });
   };
   const groups = {
     ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
@@ -891,9 +952,15 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
     <div className="visual-column">
       <div className="detail-heading"><span>Vista vectorial · PDF original</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
       <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda del mouse sobre la vista para acercar o alejar</span><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
-      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"} onWheel={zoomWithWheel}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><div className="vector-interaction-layer" onClick={samplePreview} aria-label={eyedropper ? "Seleccionar un punto de color" : "Vista vectorial del PDF original"} />{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
+      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"} onWheel={zoomWithWheel}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><svg className={eyedropper ? "vector-object-map active" : "vector-object-map"} viewBox="0 0 1 1" preserveAspectRatio="none" onClick={selectEmptyPoint} aria-label={eyedropper ? `${analysis.paintRegions.length} objetos seleccionables en la primera página` : "Mapa de objetos vectoriales"}>{analysis.paintRegions.map((object) => <path key={object.id} className={`vector-hit ${object.paint} ${currentSample?.objectId === object.id ? "selected" : ""}`} d={object.d} fill={object.paint === "fill" ? "rgba(0,0,0,.001)" : "none"} fillRule={object.fillRule} stroke={object.paint === "stroke" ? "rgba(0,0,0,.001)" : "none"} strokeWidth={Math.max(object.strokeWidth, 0.004)} onClick={(event) => selectVectorObject(event, object)}><title>{object.kind === "raster" ? "Imagen ráster" : object.kind === "text" ? "Objeto de texto" : "Trazado vectorial"}</title></path>)}</svg>{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
       {analysis.thumbnail && <img ref={sampleImageRef} className="sampling-source" src={analysis.thumbnail} alt="" aria-hidden="true" onLoad={(event) => setPageRatio(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />}
-      <div className="color-readout"><span>CUENTAGOTAS DE COLOR ORIGINAL</span><div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? "Haz clic sobre un objeto de la vista vectorial." : "Actívalo para leer el color original del objeto."}</small></div>{currentSample && !activeColor && <div className="sample-result empty"><div><span>SIN COLOR VECTORIAL IDENTIFICABLE</span><b>Este punto puede pertenecer a una imagen ráster, texto, máscara o zona transparente.</b></div><small>No se convierte el píxel de pantalla a RGB ni se inventa un CMYK.</small></div>}{activeColor && <><div className="sample-result found"><div><span>OBJETO VECTORIAL SELECCIONADO</span><b>{activeColor.space} original · {activeColor.source}</b></div><small>Valor leído del operador de color asociado al objeto.</small></div><div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>ORIGEN DEL COLOR</span><b>{activeColor.source}</b></div></div></>}<small>El cuentagotas identifica el objeto vectorial bajo el cursor y muestra sus valores originales del PDF. No toma el RGB de la pantalla.</small></div>
+      <div className="color-readout">
+        <span>CUENTAGOTAS DE OBJETOS REALES</span>
+        <div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? `Haz clic directamente sobre uno de los ${analysis.paintRegions.length.toLocaleString("es-UY")} objetos detectados.` : "Actívalo para seleccionar trazados, texto e imágenes del PDF."}</small></div>
+        {currentSample && !activeColor && <div className="sample-result empty"><div><span>{currentSample.kind === "raster" ? "IMAGEN RÁSTER SELECCIONADA" : currentSample.kind === "text" ? "OBJETO DE TEXTO SELECCIONADO" : currentSample.kind === "vector" ? "TRAZADO VECTORIAL SELECCIONADO" : "NO HAY UN OBJETO EN ESTE PUNTO"}</span><b>{currentSample.kind === "raster" ? "La imagen es un objeto real, pero no contiene un único CMYK vectorial para toda su superficie." : currentSample.kind === "empty" ? "Haz clic sobre el contorno o el interior de un objeto visible." : "El objeto fue localizado, pero su color usa una máscara, patrón o recurso que no expone una composición directa."}</b></div><small>No se convierte el píxel de pantalla a RGB ni se inventa un CMYK.</small></div>}
+        {activeColor && <><div className="sample-result found"><div><span>{currentSample?.kind === "text" ? "OBJETO DE TEXTO SELECCIONADO" : "TRAZADO VECTORIAL SELECCIONADO"}</span><b>{activeColor.space} original · {activeColor.source}</b></div><small>El clic ocurrió sobre la geometría SVG exacta de este objeto.</small></div><div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>ORIGEN DEL COLOR</span><b>{activeColor.source}</b></div></div></>}
+        <small>La selección se realiza sobre cada trazado SVG reconstruido desde el PDF, no sobre una muestra RGB ni sobre un rectángulo aproximado.</small>
+      </div>
     </div>
     <div className="technical-column">
       <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
