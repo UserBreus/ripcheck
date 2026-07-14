@@ -256,17 +256,13 @@ button { color: inherit; }
 .eyedropper-button:hover:not(:disabled), .eyedropper-button:focus-visible, .eyedropper-button.active { background: var(--lime); outline: none; }
 .eyedropper-button:disabled { opacity: .45; cursor: not-allowed; }
 .color-tools small { color: var(--muted); font-size: 9px; line-height: 1.35; }
-.color-swatches { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.color-swatch { width: 32px; height: 32px; display: block; padding: 0; border: 1px solid rgba(23,32,27,.22); border-radius: 3px; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }
-.color-swatch:hover { transform: translateY(-2px); }
-.color-swatch.active { box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--ink); }
-.color-swatch:focus-visible { outline: 3px solid var(--lime); outline-offset: 2px; }
-.sample-result { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 3px 10px; align-items: center; margin-bottom: 10px; padding: 10px; border: 1px solid var(--line); border-left: 3px solid var(--lime); background: var(--paper); }
-.sample-chip { width: 30px; height: 30px; grid-row: 1 / 3; display: block; border: 1px solid rgba(23,32,27,.3); border-radius: 3px; }
+.sample-result { display: grid; gap: 5px; margin-bottom: 10px; padding: 11px 12px; border: 1px solid var(--line); border-left: 3px solid var(--lime); background: var(--paper); }
+.sample-result.empty { border-left-color: var(--amber); background: var(--amber-soft); }
+.sample-result.found { border-left-color: var(--green); background: var(--green-soft); }
 .sample-result div span, .sample-result div b { display: block; }
 .sample-result div span { margin-bottom: 3px; color: var(--muted); font-family: var(--font-plex-mono), monospace; font-size: 7px; letter-spacing: .7px; }
-.sample-result div b { font-family: var(--font-plex-mono), monospace; font-size: 9px; overflow-wrap: anywhere; }
-.sample-result > small { grid-column: 2; color: var(--muted); font-size: 8px; }
+.sample-result div b { font-family: var(--font-plex-mono), monospace; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.sample-result > small { color: var(--muted); font-size: 8px; }
 .color-composition { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 1px; margin: 0 0 9px; overflow: hidden; border: 1px solid var(--line); border-radius: 3px; background: var(--line); }
 .color-composition > div { min-width: 0; padding: 11px 12px; background: var(--card); }
 .color-composition span, .color-composition b { display: block; }

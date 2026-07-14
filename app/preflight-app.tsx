@@ -10,6 +10,7 @@ type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
 type Check = { id: string; title: string; detail: string; severity: Severity; value?: string; scope?: "rip" | "quality" | "info" };
 type Metadata = { title: string; author: string; creator: string; producer: string; created: string };
+type PdfPaintRegion = { colorId: string; x1: number; y1: number; x2: number; y2: number; paint: "fill" | "stroke"; area: number; order: number };
 
 type Analysis = {
   id: string;
@@ -26,6 +27,7 @@ type Analysis = {
   colorSpaces: string[];
   dominantColors: string[];
   sourceColors: PdfSourceColor[];
+  paintRegions: PdfPaintRegion[];
   spotColors: string[];
   profileName: string;
   fontNames: string[];
@@ -165,6 +167,67 @@ function getImagePpi(operatorList: { fnArray: number[]; argsArray: unknown[][] }
   return { values, imageCount };
 }
 
+function paintRegions(
+  operatorList: { fnArray: number[]; argsArray: unknown[][] },
+  OPS: PdfJs["OPS"],
+  viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): [number, number] },
+  sourceColors: PdfSourceColor[],
+) {
+  type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null };
+  let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null };
+  const stack: PaintState[] = [];
+  const regions: PdfPaintRegion[] = [];
+
+  const colorIdFromArgs = (args: unknown[]) => {
+    const hex = typeof args[0] === "string" && /^#[0-9a-f]{6}$/i.test(args[0]) ? args[0] : null;
+    return hex ? nearestSourceColor(sourceColors, hex)?.color.id || null : null;
+  };
+  const transformedBounds = (bounds: ArrayLike<number>) => {
+    if (bounds.length < 4) return null;
+    const [x1, y1, x2, y2] = Array.from({ length: 4 }, (_, index) => Number(bounds[index]));
+    if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+    const points = [[x1, y1], [x1, y2], [x2, y1], [x2, y2]].map(([x, y]) => {
+      const transformedX = state.ctm[0] * x + state.ctm[2] * y + state.ctm[4];
+      const transformedY = state.ctm[1] * x + state.ctm[3] * y + state.ctm[5];
+      return viewport.convertToViewportPoint(transformedX, transformedY);
+    });
+    const xs = points.map((point) => point[0] / viewport.width);
+    const ys = points.map((point) => point[1] / viewport.height);
+    return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+  };
+  const addRegion = (bounds: ArrayLike<number>, colorId: string | null, paint: PdfPaintRegion["paint"]) => {
+    if (!colorId || regions.length >= 6000) return;
+    const normalized = transformedBounds(bounds);
+    if (!normalized || normalized.x2 < 0 || normalized.y2 < 0 || normalized.x1 > 1 || normalized.y1 > 1) return;
+    const x1 = Math.max(0, normalized.x1);
+    const y1 = Math.max(0, normalized.y1);
+    const x2 = Math.min(1, normalized.x2);
+    const y2 = Math.min(1, normalized.y2);
+    regions.push({ colorId, x1, y1, x2, y2, paint, area: Math.max(0, (x2 - x1) * (y2 - y1)), order: regions.length });
+  };
+
+  operatorList.fnArray.forEach((fn, index) => {
+    const args = operatorList.argsArray[index] || [];
+    if (fn === OPS.save) stack.push({ ...state, ctm: [...state.ctm] });
+    else if (fn === OPS.restore) state = stack.pop() || state;
+    else if (fn === OPS.transform && args.length >= 6) state.ctm = multiply(state.ctm, args.slice(0, 6).map(Number) as Matrix);
+    else if (fn === OPS.paintFormXObjectBegin && Array.isArray(args[0]) && args[0].length >= 6) {
+      stack.push({ ...state, ctm: [...state.ctm] });
+      state.ctm = multiply(state.ctm, args[0].slice(0, 6).map(Number) as Matrix);
+    } else if (fn === OPS.paintFormXObjectEnd) state = stack.pop() || state;
+    else if (fn === OPS.setFillRGBColor || fn === OPS.setFillCMYKColor || fn === OPS.setFillGray || fn === OPS.setFillColor || fn === OPS.setFillColorN) state.fillColorId = colorIdFromArgs(args);
+    else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeCMYKColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeColor || fn === OPS.setStrokeColorN) state.strokeColorId = colorIdFromArgs(args);
+    else if (fn === OPS.constructPath) {
+      const paint = Number(args[0]);
+      const bounds = args[2] as ArrayLike<number> | undefined;
+      if (!bounds) return;
+      if ([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(bounds, state.fillColorId, "fill");
+      if ([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(bounds, state.strokeColorId, "stroke");
+    }
+  });
+  return regions;
+}
+
 function dominantColors(canvas: HTMLCanvasElement) {
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return [];
@@ -231,6 +294,7 @@ function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
     colorSpaces: [],
     dominantColors: [],
     sourceColors: [],
+    paintRegions: [],
     spotColors: [],
     profileName: "No detectable",
     fontNames: [],
@@ -283,7 +347,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const inspectionText = `${raw}\n${contentText}`;
   const crossReference = validateCrossReference(bytes);
   const pdfStructure = inspectPdfStructure(raw, contentText);
-  const sourceColors = extractSourceColors(raw, contentText);
+  const sourceColors = extractSourceColors(raw, contentText, 64);
   const embeddedProfiles = await embeddedIccProfiles(bytes, raw);
 
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -314,6 +378,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   let thumbnail: string | null = null;
   let visualHash: string | null = null;
   let detectedColors: string[] = [];
+  let firstPagePaintRegions: PdfPaintRegion[] = [];
 
   for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
@@ -342,6 +407,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
       thumbnail = rendered.thumbnail;
       visualHash = rendered.visualHash;
       detectedColors = rendered.colors;
+      firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, sourceColors);
     }
     page.cleanup();
   }
@@ -490,6 +556,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     colorSpaces,
     dominantColors: detectedColors,
     sourceColors,
+    paintRegions: firstPagePaintRegions,
     spotColors,
     profileName,
     fontNames: Array.from(fontNames).slice(0, 16),
@@ -757,15 +824,15 @@ export function PreflightApp() {
 }
 
 function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analysis; targetPpi: number }) {
-  const [selectedColor, setSelectedColor] = useState<string | null>(null);
+  const [selectedColorId, setSelectedColorId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [eyedropper, setEyedropper] = useState(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [pageRatio, setPageRatio] = useState(1 / 1.414);
-  const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number; hex: string; distance: number | null } | null>(null);
+  const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number } | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const sampleImageRef = useRef<HTMLImageElement>(null);
-  const activeColor = analysis.sourceColors.find((color) => color.id === selectedColor) || analysis.sourceColors[0] || null;
+  const activeColor = analysis.sourceColors.find((color) => color.id === selectedColorId) || null;
   const currentSample = sampledPoint?.analysisId === analysis.id ? sampledPoint : null;
   const changeZoom = (amount: number) => setZoom((current) => Math.min(4, Math.max(0.5, Number((current + amount).toFixed(2)))));
 
@@ -774,6 +841,7 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
     setPdfUrl(url);
     setZoom(1);
     setEyedropper(false);
+    setSelectedColorId(null);
     setSampledPoint(null);
     return () => URL.revokeObjectURL(url);
   }, [file]);
@@ -799,28 +867,18 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
 
   const samplePreview = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!eyedropper) return;
-    const image = sampleImageRef.current;
     const bounds = event.currentTarget.getBoundingClientRect();
-    if (!image) return;
-    if (!bounds.width || !bounds.height || !image.naturalWidth || !image.naturalHeight) return;
+    if (!bounds.width || !bounds.height) return;
     const x = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
     const y = Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height));
-    const canvas = document.createElement("canvas");
-    canvas.width = image.naturalWidth;
-    canvas.height = image.naturalHeight;
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    if (!context) return;
-    context.drawImage(image, 0, 0);
-    const pixel = context.getImageData(
-      Math.min(canvas.width - 1, Math.floor(x * canvas.width)),
-      Math.min(canvas.height - 1, Math.floor(y * canvas.height)),
-      1,
-      1,
-    ).data;
-    const hex = `#${[pixel[0], pixel[1], pixel[2]].map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
-    const nearest = nearestSourceColor(analysis.sourceColors, hex);
-    if (nearest) setSelectedColor(nearest.color.id);
-    setSampledPoint({ analysisId: analysis.id, x, y, hex, distance: nearest?.distance ?? null });
+    const hits = analysis.paintRegions
+      .filter((region) => {
+        const tolerance = region.paint === "stroke" ? 0.012 : 0;
+        return x >= region.x1 - tolerance && x <= region.x2 + tolerance && y >= region.y1 - tolerance && y <= region.y2 + tolerance;
+      })
+      .sort((a, b) => a.area - b.area || b.order - a.order);
+    setSelectedColorId(hits[0]?.colorId || null);
+    setSampledPoint({ analysisId: analysis.id, x, y });
   };
   const groups = {
     ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
@@ -835,7 +893,7 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
       <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda del mouse sobre la vista para acercar o alejar</span><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
       <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"} onWheel={zoomWithWheel}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><div className="vector-interaction-layer" onClick={samplePreview} aria-label={eyedropper ? "Seleccionar un punto de color" : "Vista vectorial del PDF original"} />{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
       {analysis.thumbnail && <img ref={sampleImageRef} className="sampling-source" src={analysis.thumbnail} alt="" aria-hidden="true" onLoad={(event) => setPageRatio(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />}
-      <div className="color-readout"><span>COLORES REALES DEL ARCHIVO</span><div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? "Haz clic sobre cualquier punto de la vista real." : "Actívalo para inspeccionar un punto del diseño."}</small></div><div className="color-swatches">{analysis.sourceColors.length ? analysis.sourceColors.map((color) => <button key={color.id} className={activeColor?.id === color.id ? "color-swatch active" : "color-swatch"} type="button" style={{ backgroundColor: color.preview }} onClick={() => { setSelectedColor(color.id); setSampledPoint(null); }} aria-label={`Mostrar ${color.space}: ${sourceColorValues(color)}`} aria-pressed={activeColor?.id === color.id} title={`${color.space} · ${sourceColorValues(color)}`} />) : <small>No se encontraron colores vectoriales extraíbles.</small>}</div>{currentSample && <div className="sample-result"><span className="sample-chip" style={{ backgroundColor: currentSample.hex }} /><div><span>PUNTO MUESTREADO</span><b>{currentSample.hex} · RGB visible</b></div><small>{activeColor ? "Vinculado al color original más cercano" : "Sin color original extraíble para vincular"}</small></div>}{activeColor && <div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>VISTA APROX.</span><b>{activeColor.preview}</b></div></div>}<small>{currentSample ? "El cuentagotas usa la vista para localizar el punto y muestra la composición original más cercana del PDF. Los porcentajes y el perfil provienen del archivo." : "Valores leídos directamente de los operadores del PDF. La muestra visual es aproximada; los porcentajes y el perfil son los datos originales."}</small></div>
+      <div className="color-readout"><span>CUENTAGOTAS DE COLOR ORIGINAL</span><div className="color-tools"><button className={eyedropper ? "eyedropper-button active" : "eyedropper-button"} type="button" onClick={() => setEyedropper((active) => !active)} disabled={!analysis.thumbnail} aria-pressed={eyedropper}><span>⌖</span>{eyedropper ? "Cuentagotas activo" : "Cuentagotas"}</button><small>{eyedropper ? "Haz clic sobre un objeto de la vista vectorial." : "Actívalo para leer el color original del objeto."}</small></div>{currentSample && !activeColor && <div className="sample-result empty"><div><span>SIN COLOR VECTORIAL IDENTIFICABLE</span><b>Este punto puede pertenecer a una imagen ráster, texto, máscara o zona transparente.</b></div><small>No se convierte el píxel de pantalla a RGB ni se inventa un CMYK.</small></div>}{activeColor && <><div className="sample-result found"><div><span>OBJETO VECTORIAL SELECCIONADO</span><b>{activeColor.space} original · {activeColor.source}</b></div><small>Valor leído del operador de color asociado al objeto.</small></div><div className="color-composition source"><div><span>ESPACIO ORIGINAL</span><b>{activeColor.space}</b></div><div><span>COMPOSICIÓN REAL</span><b>{sourceColorValues(activeColor)}</b></div><div><span>PERFIL ICC</span><b>{analysis.profileName}</b></div><div><span>ORIGEN DEL COLOR</span><b>{activeColor.source}</b></div></div></>}<small>El cuentagotas identifica el objeto vectorial bajo el cursor y muestra sus valores originales del PDF. No toma el RGB de la pantalla.</small></div>
     </div>
     <div className="technical-column">
       <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
