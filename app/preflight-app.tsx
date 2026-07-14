@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
-import { decodedContentStreams, embeddedIccProfiles, extractSourceColors, inspectPdfStructure, type LayerState, type PdfSourceColor } from "./pdf-structure";
+import { decodedContentStreams, embeddedIccProfiles, extractSourceColorOccurrences, extractSourceColors, inspectPdfStructure, resolveOriginalColorOccurrence, type LayerState, type PdfColorOccurrence, type PdfSourceColor } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
 type Status = "ready" | "caution" | "blocked";
@@ -180,16 +180,27 @@ function paintRegions(
   operatorList: { fnArray: number[]; argsArray: unknown[][] },
   OPS: PdfJs["OPS"],
   viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): [number, number] },
-  sourceColors: PdfSourceColor[],
+  colorOccurrences: PdfColorOccurrence[],
 ) {
   type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null; lineWidth: number; textMatrix: Matrix; fontSize: number };
   let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null, lineWidth: 1, textMatrix: [...IDENTITY], fontSize: 12 };
   const stack: PaintState[] = [];
   const regions: PdfPaintRegion[] = [];
+  const occurrenceQueues = {
+    fill: colorOccurrences.filter((color) => color.target === "fill"),
+    stroke: colorOccurrences.filter((color) => color.target === "stroke"),
+  };
+  const occurrenceCursor = { fill: 0, stroke: 0 };
 
-  const colorIdFromArgs = (args: unknown[]) => {
+  const colorIdFromArgs = (args: unknown[], target: PdfColorOccurrence["target"]) => {
     const hex = typeof args[0] === "string" && /^#[0-9a-f]{6}$/i.test(args[0]) ? args[0] : null;
-    return hex ? nearestSourceColor(sourceColors, hex)?.color.id || null : null;
+    const queue = occurrenceQueues[target];
+    const resolved = resolveOriginalColorOccurrence(queue, occurrenceCursor[target], hex);
+    if (resolved.color) {
+      occurrenceCursor[target] = resolved.nextCursor;
+      return resolved.color.id;
+    }
+    return null;
   };
   const matrixFrom = (value: unknown): Matrix | null => {
     const matrix = value as ArrayLike<number> | null;
@@ -247,8 +258,8 @@ function paintRegions(
       state.ctm = multiply(state.ctm, matrixFrom(args[0])!);
     } else if (fn === OPS.paintFormXObjectEnd) state = stack.pop() || state;
     else if (fn === OPS.setLineWidth) state.lineWidth = Math.max(0, Number(args[0]) || 0);
-    else if (fn === OPS.setFillRGBColor || fn === OPS.setFillCMYKColor || fn === OPS.setFillGray || fn === OPS.setFillColor || fn === OPS.setFillColorN) state.fillColorId = colorIdFromArgs(args);
-    else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeCMYKColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeColor || fn === OPS.setStrokeColorN) state.strokeColorId = colorIdFromArgs(args);
+    else if (fn === OPS.setFillRGBColor || fn === OPS.setFillCMYKColor || fn === OPS.setFillGray || fn === OPS.setFillColor || fn === OPS.setFillColorN) state.fillColorId = colorIdFromArgs(args, "fill");
+    else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeCMYKColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeColor || fn === OPS.setStrokeColorN) state.strokeColorId = colorIdFromArgs(args, "stroke");
     else if (fn === OPS.setFillTransparent) state.fillColorId = null;
     else if (fn === OPS.setStrokeTransparent) state.strokeColorId = null;
     else if (fn === OPS.beginText) state.textMatrix = [...IDENTITY];
@@ -403,6 +414,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const inspectionText = `${raw}\n${contentText}`;
   const crossReference = validateCrossReference(bytes);
   const pdfStructure = inspectPdfStructure(raw, contentText);
+  const colorOccurrences = extractSourceColorOccurrences(raw, contentText);
   const sourceColors = extractSourceColors(raw, contentText, 64);
   const embeddedProfiles = await embeddedIccProfiles(bytes, raw);
 
@@ -459,7 +471,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     ppiValues.push(...imageResult.values);
 
     if (pageNumber === 1) {
-      firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, sourceColors);
+      firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, colorOccurrences);
       const rendered = await renderFirstPage(page);
       thumbnail = rendered.thumbnail;
       visualHash = rendered.visualHash;
@@ -659,33 +671,6 @@ function sourceColorValues(color: PdfSourceColor) {
   if (color.space === "RGB") return ["R", "G", "B"].map((channel, index) => `${channel} ${value(color.values[index])}`).join(" · ");
   if (color.space === "Gray") return `GRIS ${value(color.values[0])}`;
   return color.values.map((number, index) => `T${index + 1} ${value(number)}`).join(" · ");
-}
-
-function hexToRgb(hex: string) {
-  const normalized = hex.replace("#", "");
-  if (!/^[0-9a-f]{6}$/i.test(normalized)) return null;
-  return {
-    r: Number.parseInt(normalized.slice(0, 2), 16),
-    g: Number.parseInt(normalized.slice(2, 4), 16),
-    b: Number.parseInt(normalized.slice(4, 6), 16),
-  };
-}
-
-function nearestSourceColor(colors: PdfSourceColor[], sampledHex: string) {
-  const sampled = hexToRgb(sampledHex);
-  if (!sampled) return null;
-  let nearest: { color: PdfSourceColor; distance: number } | null = null;
-  for (const color of colors) {
-    const preview = hexToRgb(color.preview);
-    if (!preview) continue;
-    const distance = Math.sqrt(
-      (sampled.r - preview.r) ** 2 +
-      (sampled.g - preview.g) ** 2 +
-      (sampled.b - preview.b) ** 2,
-    );
-    if (!nearest || distance < nearest.distance) nearest = { color, distance };
-  }
-  return nearest;
 }
 
 function sourceColorSummary(analysis: Analysis) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { embeddedIccProfiles, extractSourceColors, inspectPdfStructure } from "../app/pdf-structure.ts";
+import { embeddedIccProfiles, extractSourceColorOccurrences, extractSourceColors, inspectPdfStructure, resolveOriginalColorOccurrence } from "../app/pdf-structure.ts";
 
 test("blocks orphan OCG layers and missing font resources", () => {
   const raw = `%PDF-1.6
@@ -86,6 +86,24 @@ endobj
     { space: "CMYK", values: [0, 0.94, 0.91, 0], source: "ICCBased" },
     { space: "CMYK", values: [0, 0, 0, 1], source: "DeviceCMYK" },
   ]);
+});
+
+test("preserves the original color operator order and fill or stroke target", () => {
+  const occurrences = extractSourceColorOccurrences("%PDF-1.7", "0 1 1 0 k 1 0 0 rg 1 0 0 0 K");
+
+  assert.deepEqual(occurrences.map(({ space, values, target }) => ({ space, values, target })), [
+    { space: "CMYK", values: [0, 1, 1, 0], target: "fill" },
+    { space: "RGB", values: [1, 0, 0], target: "fill" },
+    { space: "CMYK", values: [1, 0, 0, 0], target: "stroke" },
+  ]);
+});
+
+test("keeps CMYK source values when the following RGB color looks closer on screen", () => {
+  const queue = extractSourceColorOccurrences("%PDF-1.7", "0 0.204 0.98 0 k 1 0.78 0.22 rg").filter((color) => color.target === "fill");
+  const resolved = resolveOriginalColorOccurrence(queue, 0, "#FFC737");
+
+  assert.equal(resolved.color?.space, "CMYK");
+  assert.deepEqual(resolved.color?.values, [0, 0.204, 0.98, 0]);
 });
 
 test("reads the description from an embedded ICC profile", async () => {

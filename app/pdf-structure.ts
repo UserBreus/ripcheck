@@ -7,6 +7,7 @@ export type PdfSourceColor = {
   source: string;
   uses: number;
 };
+export type PdfColorOccurrence = PdfSourceColor & { target: "fill" | "stroke"; sequence: number };
 
 function decodeAscii85(source: Uint8Array) {
   const input = new TextDecoder("latin1").decode(source).replace(/\s+/g, "").replace(/^<~/, "").replace(/~>[\s\S]*$/, "");
@@ -205,23 +206,21 @@ function colorSpaceMap(raw: string) {
   return spaces;
 }
 
-export function extractSourceColors(raw: string, contentText: string, limit = 18): PdfSourceColor[] {
+export function extractSourceColorOccurrences(raw: string, contentText: string, limit = 10000): PdfColorOccurrence[] {
   const spaces = colorSpaceMap(raw);
-  const colors = new Map<string, PdfSourceColor>();
+  const occurrences: PdfColorOccurrence[] = [];
   const tokens = contentText.match(/\/[A-Za-z0-9_.-]+|[-+]?(?:\d*\.\d+|\d+)|[A-Za-z][A-Za-z0-9*']*/g) || [];
   let numbers: number[] = [];
   let names: string[] = [];
   let fillSpace: string | null = null;
   let strokeSpace: string | null = null;
 
-  const add = (space: PdfSourceColor["space"], values: number[], source: string) => {
-    if (!values.length || values.some((value) => !Number.isFinite(value))) return;
+  const add = (space: PdfSourceColor["space"], values: number[], source: string, target: PdfColorOccurrence["target"]) => {
+    if (!values.length || values.some((value) => !Number.isFinite(value)) || occurrences.length >= limit) return;
     const normalized = values.map((value) => Math.max(0, Math.min(1, value)));
     const rounded = normalized.map((value) => Math.round(value * 1000) / 1000);
     const key = `${space}:${rounded.join(":")}`;
-    const existing = colors.get(key);
-    if (existing) existing.uses += 1;
-    else colors.set(key, { id: key, space, values: rounded, preview: colorPreview(space, rounded), source, uses: 1 });
+    occurrences.push({ id: key, space, values: rounded, preview: colorPreview(space, rounded), source, uses: 1, target, sequence: occurrences.length });
   };
 
   for (const token of tokens) {
@@ -236,24 +235,64 @@ export function extractSourceColors(raw: string, contentText: string, limit = 18
 
     if (token === "cs") fillSpace = names.at(-1) || null;
     else if (token === "CS") strokeSpace = names.at(-1) || null;
-    else if ((token === "k" || token === "K") && numbers.length >= 4) add("CMYK", numbers.slice(-4), "DeviceCMYK");
-    else if ((token === "rg" || token === "RG") && numbers.length >= 3) add("RGB", numbers.slice(-3), "DeviceRGB");
-    else if ((token === "g" || token === "G") && numbers.length >= 1) add("Gray", numbers.slice(-1), "DeviceGray");
+    else if ((token === "k" || token === "K") && numbers.length >= 4) add("CMYK", numbers.slice(-4), "DeviceCMYK", token === "k" ? "fill" : "stroke");
+    else if ((token === "rg" || token === "RG") && numbers.length >= 3) add("RGB", numbers.slice(-3), "DeviceRGB", token === "rg" ? "fill" : "stroke");
+    else if ((token === "g" || token === "G") && numbers.length >= 1) add("Gray", numbers.slice(-1), "DeviceGray", token === "g" ? "fill" : "stroke");
     else if (token === "scn" || token === "SCN") {
       const selected = spaces.get(token === "scn" ? fillSpace || "" : strokeSpace || "");
       const components = selected?.components || numbers.length;
       const values = numbers.length >= components ? numbers.slice(-components) : [];
       const source = selected?.source || `${components} canales`;
-      if (components === 4 && source !== "DeviceN") add("CMYK", values, source);
-      else if (components === 3) add("RGB", values, source);
-      else if (components === 1 && source !== "Separation") add("Gray", values, source);
-      else add("Tint", values, source);
+      const target = token === "scn" ? "fill" : "stroke";
+      if (components === 4 && source !== "DeviceN") add("CMYK", values, source, target);
+      else if (components === 3) add("RGB", values, source, target);
+      else if (components === 1 && source !== "Separation") add("Gray", values, source, target);
+      else add("Tint", values, source, target);
     }
     numbers = [];
     names = [];
   }
 
+  return occurrences;
+}
+
+export function extractSourceColors(raw: string, contentText: string, limit = 18): PdfSourceColor[] {
+  const colors = new Map<string, PdfSourceColor>();
+  for (const occurrence of extractSourceColorOccurrences(raw, contentText)) {
+    const existing = colors.get(occurrence.id);
+    if (existing) existing.uses += 1;
+    else colors.set(occurrence.id, { id: occurrence.id, space: occurrence.space, values: occurrence.values, preview: occurrence.preview, source: occurrence.source, uses: 1 });
+  }
   return Array.from(colors.values()).sort((a, b) => b.uses - a.uses).slice(0, limit);
+}
+
+function previewDistance(first: string, second: string) {
+  const rgb = (hex: string) => /^#[0-9a-f]{6}$/i.test(hex)
+    ? [Number.parseInt(hex.slice(1, 3), 16), Number.parseInt(hex.slice(3, 5), 16), Number.parseInt(hex.slice(5, 7), 16)]
+    : null;
+  const a = rgb(first);
+  const b = rgb(second);
+  return a && b ? Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) : Number.POSITIVE_INFINITY;
+}
+
+export function resolveOriginalColorOccurrence(queue: PdfColorOccurrence[], cursor: number, displayHex: string | null) {
+  let selectedIndex = cursor;
+  let color = queue[selectedIndex] || null;
+  if (color && displayHex) {
+    const currentDistance = previewDistance(color.preview, displayHex);
+    if (currentDistance > 110) {
+      let bestDistance = currentDistance;
+      for (let index = selectedIndex + 1; index < Math.min(queue.length, selectedIndex + 40); index += 1) {
+        const distance = previewDistance(queue[index].preview, displayHex);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          selectedIndex = index;
+          color = queue[index];
+        }
+      }
+    }
+  }
+  return { color, nextCursor: color ? selectedIndex + 1 : cursor };
 }
 
 export function inspectPdfStructure(raw: string, contentText: string) {
