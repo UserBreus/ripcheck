@@ -214,7 +214,8 @@ button { color: inherit; }
 .inline-progress > span { position: absolute; inset: 0 auto 0 0; opacity: .13; }
 .inline-progress p { position: relative; z-index: 1; margin: 0; padding: 10px 14px; font-size: 10px; font-weight: 800; }
 .file-tabs { display: flex; gap: 8px; margin: 18px 0; padding-bottom: 4px; overflow-x: auto; scrollbar-width: thin; }
-.file-tab { min-width: 210px; max-width: 300px; display: grid; grid-template-columns: 9px 1fr; gap: 3px 9px; align-items: center; padding: 13px 15px; border: 1px solid var(--line); border-radius: 3px; background: rgba(255,255,255,.55); cursor: pointer; text-align: left; }
+.file-tab-shell { min-width: 210px; max-width: 300px; position: relative; flex: 0 0 auto; }
+.file-tab { width: 100%; min-height: 61px; display: grid; grid-template-columns: 9px 1fr; gap: 3px 9px; align-items: center; padding: 13px 46px 13px 15px; border: 1px solid var(--line); border-radius: 3px; background: rgba(255,255,255,.55); cursor: pointer; text-align: left; }
 .file-tab.active { background: var(--card); border-color: var(--ink); box-shadow: inset 0 -3px 0 var(--lime); }
 .file-tab i { width: 8px; height: 8px; border-radius: 50%; }
 .file-tab i.ready { background: var(--green); }
@@ -222,6 +223,8 @@ button { color: inherit; }
 .file-tab i.blocked { background: var(--red); }
 .file-tab span { overflow: hidden; font-size: 11px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
 .file-tab b { grid-column: 2; color: var(--muted); font-family: var(--font-plex-mono), monospace; font-size: 9px; font-weight: 500; }
+.file-remove { width: 32px; height: 32px; position: absolute; top: 8px; right: 8px; display: grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 3px; color: var(--muted); background: transparent; cursor: pointer; font-family: Arial, sans-serif; font-size: 22px; line-height: 1; transition: .16s ease; }
+.file-remove:hover, .file-remove:focus-visible { color: var(--red); border-color: rgba(184,59,50,.25); background: var(--red-soft); outline: none; }
 .file-detail { display: grid; grid-template-columns: minmax(340px, .74fr) minmax(600px, 1.26fr); gap: 18px; align-items: start; }
 .visual-column, .technical-column { background: var(--card); border: 1px solid var(--line); }
 .visual-column { padding: 16px; position: sticky; top: 16px; }
@@ -307,7 +310,7 @@ button { color: inherit; }
   .batch-counts span { border-right: 0; border-bottom: 1px solid rgba(23,32,27,.13); }
   .batch-counts span:last-child { border-bottom: 0; }
   .status-pair { grid-template-columns: 1fr; }
-  .file-tab { min-width: 185px; }
+  .file-tab-shell { min-width: 185px; }
   .technical-column { padding: 11px; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .metric { min-height: 94px; }

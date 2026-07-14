@@ -611,6 +611,16 @@ export function PreflightApp() {
     setError(null);
   }
 
+  function removeFile(id: string) {
+    const removedIndex = items.findIndex(({ analysis }) => analysis.id === id);
+    const next = items.filter(({ analysis }) => analysis.id !== id);
+    setItems(next);
+    if (selected?.analysis.id === id) {
+      setSelectedId(next[Math.min(Math.max(removedIndex, 0), Math.max(next.length - 1, 0))]?.analysis.id || null);
+    }
+    setError(null);
+  }
+
   function exportReport() {
     if (!items.length) return;
     const lines = [
@@ -685,7 +695,7 @@ export function PreflightApp() {
           {working && <div className="inline-progress"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /><p>Analizando {progress.name} · {progress.done}/{progress.total}</p></div>}
 
           <nav className="file-tabs" aria-label="Archivos analizados">
-            {items.map(({ analysis }) => <button key={analysis.id} className={selected?.analysis.id === analysis.id ? "file-tab active" : "file-tab"} onClick={() => setSelectedId(analysis.id)}><i className={analysis.status} /> <span>{analysis.fileName}</span><b>{ppiLabel(analysis)}</b></button>)}
+            {items.map(({ analysis }) => <div className="file-tab-shell" key={analysis.id}><button className={selected?.analysis.id === analysis.id ? "file-tab active" : "file-tab"} onClick={() => setSelectedId(analysis.id)}><i className={analysis.status} /> <span>{analysis.fileName}</span><b>{ppiLabel(analysis)}</b></button><button className="file-remove" type="button" onClick={() => removeFile(analysis.id)} aria-label={`Eliminar ${analysis.fileName}`} title="Eliminar archivo">×</button></div>)}
           </nav>
 
           {selected && <FileDetail analysis={selected.analysis} targetPpi={PROFILES[profile].dpi} />}
