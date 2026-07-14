@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { decodedContentStreams, embeddedIccProfiles, extractSourceColorOccurrences, extractSourceColors, inspectPdfStructure, resolveOriginalColorOccurrence, type LayerState, type PdfColorOccurrence, type PdfSourceColor } from "./pdf-structure";
 
 type Severity = "pass" | "warning" | "error" | "info";
@@ -872,39 +872,51 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
   const [pageRatio, setPageRatio] = useState(1 / 1.414);
   const [sampledPoint, setSampledPoint] = useState<{ analysisId: string; x: number; y: number; kind: PdfPaintRegion["kind"] | "empty"; objectId: string | null } | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(1);
   const sampleImageRef = useRef<HTMLImageElement>(null);
   const activeColor = analysis.sourceColors.find((color) => color.id === selectedColorId) || null;
   const currentSample = sampledPoint?.analysisId === analysis.id ? sampledPoint : null;
-  const changeZoom = (amount: number) => setZoom((current) => Math.min(4, Math.max(0.5, Number((current + amount).toFixed(2)))));
+  const setExactZoom = (value: number) => {
+    const next = Math.min(40, Math.max(0.5, Number(value.toFixed(3))));
+    zoomRef.current = next;
+    setZoom(next);
+  };
+  const changeZoom = (direction: -1 | 1) => setExactZoom(zoomRef.current * (direction > 0 ? 1.25 : 0.8));
 
   useEffect(() => {
     const url = URL.createObjectURL(new Blob([file], { type: "application/pdf" }));
     setPdfUrl(url);
-    setZoom(1);
+    setExactZoom(1);
     setEyedropper(false);
     setSelectedColorId(null);
     setSampledPoint(null);
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
-  const zoomWithWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
-    event.preventDefault();
+  useEffect(() => {
     const stage = stageRef.current;
-    if (!stage || !pdfUrl) return;
-    const next = Math.min(4, Math.max(0.5, Number((zoom + (event.deltaY < 0 ? 0.15 : -0.15)).toFixed(2))));
-    if (next === zoom) return;
-    const bounds = stage.getBoundingClientRect();
-    const localX = event.clientX - bounds.left;
-    const localY = event.clientY - bounds.top;
-    const contentX = stage.scrollLeft + localX;
-    const contentY = stage.scrollTop + localY;
-    const ratio = next / zoom;
-    setZoom(next);
-    requestAnimationFrame(() => {
-      stage.scrollLeft = contentX * ratio - localX;
-      stage.scrollTop = contentY * ratio - localY;
-    });
-  };
+    if (!stage) return;
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const current = zoomRef.current;
+      const next = Math.min(40, Math.max(0.5, current * Math.exp(-event.deltaY * 0.002)));
+      if (Math.abs(next - current) < 0.001) return;
+      const bounds = stage.getBoundingClientRect();
+      const localX = event.clientX - bounds.left;
+      const localY = event.clientY - bounds.top;
+      const contentX = stage.scrollLeft + localX;
+      const contentY = stage.scrollTop + localY;
+      const ratio = next / current;
+      setExactZoom(next);
+      requestAnimationFrame(() => {
+        stage.scrollLeft = contentX * ratio - localX;
+        stage.scrollTop = contentY * ratio - localY;
+      });
+    };
+    stage.addEventListener("wheel", handleWheel, { passive: false, capture: true });
+    return () => stage.removeEventListener("wheel", handleWheel, true);
+  }, []);
 
   const sampledCoordinates = (event: ReactMouseEvent<SVGElement>) => {
     const bounds = event.currentTarget.ownerSVGElement?.getBoundingClientRect() || event.currentTarget.getBoundingClientRect();
@@ -936,8 +948,8 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
   return <section className="file-detail">
     <div className="visual-column">
       <div className="detail-heading"><span>Vista vectorial · PDF original</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
-      <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda del mouse sobre la vista para acercar o alejar</span><button type="button" onClick={() => changeZoom(-0.25)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(0.25)} disabled={zoom >= 4} aria-label="Acercar">+</button></div>
-      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"} onWheel={zoomWithWheel}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><svg className={eyedropper ? "vector-object-map active" : "vector-object-map"} viewBox="0 0 1 1" preserveAspectRatio="none" onClick={selectEmptyPoint} aria-label={eyedropper ? `${analysis.paintRegions.length} objetos seleccionables en la primera página` : "Mapa de objetos vectoriales"}>{analysis.paintRegions.map((object) => <path key={object.id} className={`vector-hit ${object.paint} ${currentSample?.objectId === object.id ? "selected" : ""}`} d={object.d} fill={object.paint === "fill" ? "rgba(0,0,0,.001)" : "none"} fillRule={object.fillRule} stroke={object.paint === "stroke" ? "rgba(0,0,0,.001)" : "none"} strokeWidth={Math.max(object.strokeWidth, 0.004)} onClick={(event) => selectVectorObject(event, object)}><title>{object.kind === "raster" ? "Imagen ráster" : object.kind === "text" ? "Objeto de texto" : "Trazado vectorial"}</title></path>)}</svg>{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
+      <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda exclusiva para zoom · 50% a 4000%</span><button type="button" onClick={() => changeZoom(-1)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setExactZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(1)} disabled={zoom >= 40} aria-label="Acercar">+</button></div>
+      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><svg className={eyedropper ? "vector-object-map active" : "vector-object-map"} viewBox="0 0 1 1" preserveAspectRatio="none" onClick={selectEmptyPoint} aria-label={eyedropper ? `${analysis.paintRegions.length} objetos seleccionables en la primera página` : "Mapa de objetos vectoriales"}>{analysis.paintRegions.map((object) => <path key={object.id} className={`vector-hit ${object.paint} ${currentSample?.objectId === object.id ? "selected" : ""}`} d={object.d} fill={object.paint === "fill" ? "rgba(0,0,0,.001)" : "none"} fillRule={object.fillRule} stroke={object.paint === "stroke" ? "rgba(0,0,0,.001)" : "none"} strokeWidth={Math.max(object.strokeWidth, 0.004)} onClick={(event) => selectVectorObject(event, object)}><title>{object.kind === "raster" ? "Imagen ráster" : object.kind === "text" ? "Objeto de texto" : "Trazado vectorial"}</title></path>)}</svg>{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
       {analysis.thumbnail && <img ref={sampleImageRef} className="sampling-source" src={analysis.thumbnail} alt="" aria-hidden="true" onLoad={(event) => setPageRatio(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />}
       <div className="color-readout">
         <span>CUENTAGOTAS DE OBJETOS REALES</span>
