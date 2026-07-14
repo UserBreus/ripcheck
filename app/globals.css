@@ -240,20 +240,12 @@ button { color: inherit; }
 .color-swatch:hover { transform: translateY(-2px); }
 .color-swatch.active { box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--ink); }
 .color-swatch:focus-visible { outline: 3px solid var(--lime); outline-offset: 2px; }
-.color-composition { display: grid; grid-template-columns: .7fr 1.65fr 1.4fr .75fr; margin: 0 0 9px; overflow: hidden; border: 1px solid var(--line); border-radius: 3px; background: var(--card); }
-.color-composition > div { min-width: 0; padding: 10px 11px; border-right: 1px solid var(--line); }
-.color-composition > div:last-child { border-right: 0; }
+.color-composition { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 1px; margin: 0 0 9px; overflow: hidden; border: 1px solid var(--line); border-radius: 3px; background: var(--line); }
+.color-composition > div { min-width: 0; padding: 11px 12px; background: var(--card); }
 .color-composition span, .color-composition b { display: block; }
 .color-composition span { margin-bottom: 4px; color: var(--muted); font-family: var(--font-plex-mono), monospace; font-size: 7px; letter-spacing: .7px; }
-.color-composition b { overflow: hidden; font-family: var(--font-plex-mono), monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.color-composition b { overflow: visible; font-family: var(--font-plex-mono), monospace; font-size: 9px; line-height: 1.55; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
 .color-readout > small { color: var(--muted); font-size: 9px; }
-
-@media (max-width: 680px) {
-  .color-composition { grid-template-columns: 1fr 1fr; }
-  .color-composition > div { border-bottom: 1px solid var(--line); }
-  .color-composition > div:nth-child(2n) { border-right: 0; }
-  .color-composition > div:nth-last-child(-n+2) { border-bottom: 0; }
-}
 .technical-column { padding: 18px; }
 .single-status { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding: 14px 16px; border-radius: 3px; font-family: var(--font-plex-mono), monospace; font-size: 10px; font-weight: 700; letter-spacing: .6px; }
 .single-status.ready { color: var(--green); background: var(--green-soft); }
