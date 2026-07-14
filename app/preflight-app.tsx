@@ -7,7 +7,7 @@ type Status = "ready" | "caution" | "blocked";
 type Matrix = [number, number, number, number, number, number];
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
-type Check = { id: string; title: string; detail: string; severity: Severity; value?: string };
+type Check = { id: string; title: string; detail: string; severity: Severity; value?: string; scope?: "rip" | "quality" | "info" };
 type Metadata = { title: string; author: string; creator: string; producer: string; created: string };
 
 type Analysis = {
@@ -15,7 +15,7 @@ type Analysis = {
   fileName: string;
   fileSize: number;
   status: Status;
-  score: number;
+  qualityStatus: Status;
   format: string;
   pdfVersion: string | null;
   pages: number | null;
@@ -79,6 +79,22 @@ function rawPdfText(bytes: Uint8Array) {
   const head = bytes.slice(0, 48 * 1024 * 1024);
   const tail = bytes.slice(Math.max(0, bytes.byteLength - 12 * 1024 * 1024));
   return `${decoder.decode(head)}\n${decoder.decode(tail)}`;
+}
+
+function validateCrossReference(bytes: Uint8Array) {
+  const decoder = new TextDecoder("latin1");
+  const tailStart = Math.max(0, bytes.byteLength - 128 * 1024);
+  const tail = decoder.decode(bytes.slice(tailStart));
+  const eofIndex = tail.lastIndexOf("%%EOF");
+  const startMatches = Array.from(tail.matchAll(/startxref\s+(\d+)/g));
+  const offset = startMatches.length ? Number(startMatches[startMatches.length - 1][1]) : -1;
+  let xrefValid = false;
+  if (offset >= 0 && offset < bytes.byteLength) {
+    const target = decoder.decode(bytes.slice(offset, Math.min(bytes.byteLength, offset + 1200)));
+    xrefValid = /^\s*xref\b/.test(target) || /^\s*\d+\s+\d+\s+obj\b[\s\S]*?\/Type\s*\/XRef\b/.test(target);
+  }
+  const trailingBytes = eofIndex >= 0 ? tail.length - (eofIndex + 5) : Number.POSITIVE_INFINITY;
+  return { hasEof: eofIndex >= 0, hasStartXref: offset >= 0, xrefValid, trailingBytes };
 }
 
 function decodeAscii85(source: Uint8Array) {
@@ -258,13 +274,13 @@ function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
     fileName: file.name,
     fileSize: file.size,
     status: "blocked",
-    score: 12,
+    qualityStatus: "blocked",
     format: file.name.toLowerCase().endsWith(".ai") ? "Illustrator nativo" : "No reconocido",
     pdfVersion: null,
     pages: null,
     pagesAnalyzed: 0,
     dimensions: [],
-    checks: [check],
+    checks: [{ ...check, scope: check.scope || "rip" }],
     colorSpaces: [],
     dominantColors: [],
     spotColors: [],
@@ -297,6 +313,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     title: extension === "ai" ? "AI sin compatibilidad PDF" : "Archivo no reconocido como PDF",
     detail: extension === "ai" ? "Guarda nuevamente el AI activando “Crear archivo compatible con PDF”. Sin esa representación no es seguro enviarlo al RIP." : "La firma del archivo no corresponde a un PDF válido.",
     severity: "error",
+    scope: "rip",
     value: "NO APTO",
   });
 
@@ -305,11 +322,13 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     title: "Documento protegido o cifrado",
     detail: "Quita la contraseña y las restricciones antes de enviarlo a producción.",
     severity: "error",
+    scope: "rip",
     value: "NO APTO",
   });
 
   const contentText = await decodedContentStreams(bytes, raw);
   const inspectionText = `${raw}\n${contentText}`;
+  const crossReference = validateCrossReference(bytes);
 
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -322,6 +341,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
       title: "El documento no puede interpretarse",
       detail: "La estructura está dañada o utiliza características que impiden abrirla de forma confiable.",
       severity: "error",
+      scope: "rip",
       value: "NO APTO",
     });
   }
@@ -394,18 +414,33 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const hasText = textCharacters > 0;
   const checks: Check[] = [];
 
-  checks.push({ id: "structure", title: extension === "ai" ? "AI compatible con PDF" : "PDF interpretable", detail: `${totalPages} página${totalPages === 1 ? "" : "s"}; PDF ${version || "sin versión legible"}. La estructura pudo ser procesada.`, severity: "pass", value: "APTO PARA ABRIR" });
+  checks.push({ id: "structure", title: extension === "ai" ? "AI compatible con PDF" : "PDF interpretable", detail: `${totalPages} página${totalPages === 1 ? "" : "s"}; PDF ${version || "sin versión legible"}. El motor PDF estándar pudo interpretar ${maxPages === totalPages ? "todas las páginas" : `las primeras ${maxPages} páginas`}.`, severity: "pass", value: "INTERPRETABLE", scope: "rip" });
+
+  if (!crossReference.hasEof || !crossReference.hasStartXref || !crossReference.xrefValid) {
+    checks.push({ id: "xref", title: "Estructura de referencias PDF reparada o inválida", detail: "El visor tolerante pudo abrir el documento, pero falta o no coincide EOF/startxref/xref. Muchos RIP rechazan archivos que un visor común repara automáticamente. Reexporta o imprime a un PDF nuevo.", severity: "error", value: "REEXPORTAR", scope: "rip" });
+  } else if (crossReference.trailingBytes > 1024) {
+    checks.push({ id: "trailing", title: "Datos adicionales después del cierre PDF", detail: "Hay contenido significativo después de %%EOF. Puede ser una actualización válida, pero algunos intérpretes estrictos lo rechazan; conviene reexportar.", severity: "warning", value: "REVISAR", scope: "rip" });
+  } else {
+    checks.push({ id: "xref", title: "Tabla de referencias consistente", detail: "EOF, startxref y el destino de la tabla de referencias son coherentes.", severity: "pass", value: "CORRECTO", scope: "rip" });
+  }
+
+  const filterNames = new Set<string>();
+  for (const match of inspectionText.matchAll(/\/Filter\s*\/([A-Za-z0-9]+)/g)) filterNames.add(match[1]);
+  for (const match of inspectionText.matchAll(/\/Filter\s*\[([^\]]+)\]/g)) for (const name of match[1].matchAll(/\/([A-Za-z0-9]+)/g)) filterNames.add(name[1]);
+  const knownFilters = new Set(["FlateDecode", "Fl", "DCTDecode", "DCT", "JPXDecode", "LZWDecode", "LZW", "ASCII85Decode", "A85", "ASCIIHexDecode", "AHx", "RunLengthDecode", "RL", "CCITTFaxDecode", "CCF", "JBIG2Decode", "Crypt"]);
+  const unknownFilters = Array.from(filterNames).filter((name) => !knownFilters.has(name));
+  if (unknownFilters.length) checks.push({ id: "filters", title: `Filtros PDF no estándar: ${unknownFilters.join(", ")}`, detail: "El archivo usa filtros de flujo fuera del conjunto PDF habitual. Reexporta con compresión ZIP/JPEG convencional antes de enviarlo al RIP.", severity: "error", value: "NO COMPATIBLE", scope: "rip" });
 
   if (imageCount === 0) {
-    checks.push({ id: "ppi", title: "Arte vectorial: PPI no aplica", detail: "No se detectaron imágenes ráster colocadas. Los vectores y textos conservan resolución independiente.", severity: "pass", value: "Vectorial" });
+    checks.push({ id: "ppi", title: "Arte vectorial: PPI no aplica", detail: "No se detectaron imágenes ráster colocadas. Los vectores y textos conservan resolución independiente.", severity: "pass", value: "Vectorial", scope: "quality" });
   } else if (ppiMin === null) {
-    checks.push({ id: "ppi", title: "PPI efectivos no concluyentes", detail: `Se detectaron ${imageCount} imágenes, pero su transformación no permitió calcular el PPI real. Confírmalo en el preflight del RIP.`, severity: "warning", value: "REVISAR" });
+    checks.push({ id: "ppi", title: "PPI efectivos no concluyentes", detail: `Se detectaron ${imageCount} imágenes, pero su transformación no permitió calcular el PPI real. Confírmalo en el preflight del RIP.`, severity: "warning", value: "REVISAR", scope: "quality" });
   } else if (ppiMin < 100) {
-    checks.push({ id: "ppi", title: `Resolución insuficiente: mínimo ${ppiMin} ppp`, detail: `El objetivo seleccionado es ${targetPpi} ppp. Al menos una imagen está por debajo de 100 ppp efectivos y puede pixelarse visiblemente.`, severity: "error", value: "NO APTO" });
+    checks.push({ id: "ppi", title: `Calidad insuficiente: mínimo ${ppiMin} ppp`, detail: `El archivo puede abrir en un RIP, pero al menos una imagen está por debajo de 100 ppp efectivos y puede pixelarse visiblemente. Objetivo: ${targetPpi} ppp.`, severity: "error", value: "CALIDAD NO APTA", scope: "quality" });
   } else if (ppiMin < targetPpi) {
-    checks.push({ id: "ppi", title: `Resolución por debajo del objetivo: ${ppiMin}–${ppiMax} ppp`, detail: `Son PPI efectivos calculados con los píxeles y el tamaño real de colocación. Objetivo del trabajo: ${targetPpi} ppp.`, severity: "warning", value: `${ppiMin} ppp mín.` });
+    checks.push({ id: "ppi", title: `Resolución por debajo del objetivo: ${ppiMin}–${ppiMax} ppp`, detail: `Son PPI efectivos calculados con los píxeles y el tamaño real de colocación. Objetivo del trabajo: ${targetPpi} ppp.`, severity: "warning", value: `${ppiMin} ppp mín.`, scope: "quality" });
   } else {
-    checks.push({ id: "ppi", title: `Resolución efectiva aprobada: ${ppiMin}–${ppiMax} ppp`, detail: `Todas las colocaciones calculables alcanzan el objetivo de ${targetPpi} ppp.`, severity: "pass", value: `${ppiMin} ppp mín.` });
+    checks.push({ id: "ppi", title: `Resolución efectiva aprobada: ${ppiMin}–${ppiMax} ppp`, detail: `Todas las colocaciones calculables alcanzan el objetivo de ${targetPpi} ppp.`, severity: "pass", value: `${ppiMin} ppp mín.`, scope: "quality" });
   }
 
   checks.push({
@@ -414,6 +449,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     detail: profileName === "No declarado" ? "El RIP deberá asignar explícitamente el perfil de impresora, tinta, papel y sustrato." : "El archivo trae una referencia de color. Confirma que coincida con el perfil de producción usado por el RIP.",
     severity: profileName === "No declarado" ? "warning" : "pass",
     value: profileName,
+    scope: "quality",
   });
 
   checks.push({
@@ -422,6 +458,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     detail: colorSpaces.includes("CMYK") ? (colorSpaces.includes("RGB") ? "El documento mezcla CMYK y RGB. El RIP realizará conversiones; revisa el resultado con el ICC correcto." : "Se detectó contenido CMYK.") : colorSpaces.includes("RGB") ? "Se detectó contenido RGB. Puede ripearse si la gestión de color convierte mediante el ICC de sublimación." : "La compresión interna impide confirmar todo el contenido de color.",
     severity: colorSpaces.length ? (colorSpaces.includes("CMYK") && colorSpaces.includes("RGB") ? "warning" : "pass") : "warning",
     value: colorSpaces.join(" · ") || "REVISAR",
+    scope: "quality",
   });
 
   const rawFontCount = Array.from(raw.matchAll(/\/BaseFont\s*\//g)).length;
@@ -432,18 +469,38 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     detail: hasText ? (rawFontCount > 0 && embeddedFontCount === 0 ? "Hay texto, pero no se localizaron datos de fuente incorporada. Incrusta las fuentes o convierte a curvas." : `Texto real detectado (${textCharacters.toLocaleString("es-UY")} caracteres).`) : "El contenido puede estar trazado o rasterizado; no habrá sustitución tipográfica, pero tampoco texto editable.",
     severity: hasText && rawFontCount > 0 && embeddedFontCount === 0 ? "warning" : "pass",
     value: hasText ? "SÍ TIENE TEXTO" : "SIN TEXTO",
+    scope: hasText && rawFontCount > 0 && embeddedFontCount === 0 ? "rip" : "quality",
   });
 
   const transparency = /\/SMask\b|\/Group\s*<<[\s\S]{0,180}?\/S\s*\/Transparency\b|\/(?:ca|CA)\s+0?\.[0-9]+/i.test(inspectionText);
-  checks.push({ id: "transparency", title: transparency ? "Transparencias detectadas" : "Sin transparencias detectables", detail: transparency ? "El archivo puede ripearse, pero conviene revisar máscaras, sombras y fusiones en la vista previa del RIP." : "No se detectaron máscaras o grupos de transparencia en la estructura analizada.", severity: transparency ? "warning" : "pass", value: transparency ? "PRUEBA RIP" : "CORRECTO" });
+  checks.push({ id: "transparency", title: transparency ? "Transparencias detectadas" : "Sin transparencias detectables", detail: transparency ? "Máscaras, sombras y fusiones pueden fallar en RIP antiguos o con intérpretes PDF limitados. Aplana una copia o haz una prueba obligatoria." : "No se detectaron máscaras o grupos de transparencia en la estructura analizada.", severity: transparency ? "warning" : "pass", value: transparency ? "RIESGO RIP" : "CORRECTO", scope: "rip" });
 
-  if (spotColors.length) checks.push({ id: "spots", title: `Tintas directas: ${spotColors.join(", ")}`, detail: "Mapea estas tintas en el RIP o conviértelas al espacio acordado antes de producir.", severity: "warning", value: `${spotColors.length} detectada${spotColors.length === 1 ? "" : "s"}` });
-  if (totalPages > maxPages) checks.push({ id: "coverage", title: `Análisis detallado limitado a ${maxPages} páginas`, detail: `El archivo tiene ${totalPages} páginas. La aptitud estructural es válida, pero PPI y texto corresponden a las primeras ${maxPages}.`, severity: "info", value: `${maxPages}/${totalPages}` });
+  if (spotColors.length) checks.push({ id: "spots", title: `Tintas directas: ${spotColors.join(", ")}`, detail: "Un RIP puede rechazar o interpretar distinto DeviceN/Separation. Mapea estas tintas o conviértelas antes de producir.", severity: "warning", value: `${spotColors.length} detectada${spotColors.length === 1 ? "" : "s"}`, scope: "rip" });
 
-  const errors = checks.filter((check) => check.severity === "error").length;
-  const warnings = checks.filter((check) => check.severity === "warning").length;
-  const status: Status = errors ? "blocked" : warnings ? "caution" : "ready";
-  const score = Math.max(0, 100 - errors * 42 - warnings * 7);
+  const hasXfa = /\/XFA\b/.test(inspectionText);
+  const hasInteractive = /\/(?:RichMedia|3D|JavaScript|Launch|EmbeddedFile)\b/.test(inspectionText);
+  const hasLayers = /\/OCProperties\b|\/Type\s*\/OCG\b/.test(inspectionText);
+  const hasJpeg2000 = /\/JPXDecode\b/.test(inspectionText);
+  const hasComplexBlend = /\/BM\s*\/(?!Normal\b)[A-Za-z]+/.test(inspectionText);
+  const hasOverprint = /\/(?:OP|op)\s+true\b|\/OPM\s+[12]\b/.test(inspectionText);
+  const isPdf2 = version !== null && Number(version) >= 2;
+
+  if (hasXfa) checks.push({ id: "xfa", title: "Formulario XFA detectado", detail: "XFA no es contenido de página PDF convencional y puede no existir para el intérprete del RIP. Imprime o aplana el archivo a un PDF nuevo antes de producción.", severity: "error", value: "APLANAR", scope: "rip" });
+  if (hasInteractive) checks.push({ id: "interactive", title: "Contenido interactivo o adjunto", detail: "Se detectaron elementos no orientados a impresión. El RIP puede ignorarlos o rechazar el documento; aplana una copia de producción.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
+  if (hasLayers) checks.push({ id: "layers", title: "Capas PDF opcionales", detail: "El resultado depende del estado de visibilidad de las capas. Aplana una copia para asegurar que el RIP reciba exactamente lo visible.", severity: "warning", value: "APLANAR", scope: "rip" });
+  if (hasJpeg2000) checks.push({ id: "jpx", title: "Imágenes JPEG 2000", detail: "El filtro JPXDecode no está soportado por todos los intérpretes RIP. Convierte esas imágenes a TIFF/ZIP o JPEG convencional si PhotoPRINT no abre el archivo.", severity: "warning", value: "COMPATIBILIDAD", scope: "rip" });
+  if (hasComplexBlend) checks.push({ id: "blend", title: "Modos de fusión avanzados", detail: "Se detectaron modos distintos de Normal. La apariencia puede cambiar o fallar al rasterizar; prueba o aplana transparencias.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
+  if (hasOverprint) checks.push({ id: "overprint", title: "Sobreimpresión activa", detail: "La sobreimpresión puede producir un resultado diferente si el RIP no respeta la configuración. Verifica separaciones y simulación de sobreimpresión.", severity: "warning", value: "REVISAR", scope: "quality" });
+  if (isPdf2) checks.push({ id: "pdf2", title: "Documento PDF 2.0", detail: "Algunos RIP instalados solo admiten PDF 1.7 o anterior. Exporta una copia PDF 1.6/1.7 si el archivo no ingresa.", severity: "warning", value: "COMPATIBILIDAD", scope: "rip" });
+
+  if (totalPages > maxPages) checks.push({ id: "coverage", title: `Análisis detallado limitado a ${maxPages} páginas`, detail: `El archivo tiene ${totalPages} páginas. La interpretación estructural es válida, pero PPI y texto corresponden a las primeras ${maxPages}.`, severity: "info", value: `${maxPages}/${totalPages}`, scope: "info" });
+
+  const ripErrors = checks.filter((check) => check.scope === "rip" && check.severity === "error").length;
+  const ripWarnings = checks.filter((check) => check.scope === "rip" && check.severity === "warning").length;
+  const qualityErrors = checks.filter((check) => check.scope === "quality" && check.severity === "error").length;
+  const qualityWarnings = checks.filter((check) => check.scope === "quality" && check.severity === "warning").length;
+  const status: Status = ripErrors ? "blocked" : ripWarnings ? "caution" : "ready";
+  const qualityStatus: Status = qualityErrors ? "blocked" : qualityWarnings ? "caution" : "ready";
 
   await pdf.destroy();
   return {
@@ -451,7 +508,7 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     fileName: file.name,
     fileSize: file.size,
     status,
-    score,
+    qualityStatus,
     format: extension === "ai" ? "Illustrator · PDF compatible" : "PDF",
     pdfVersion: version,
     pages: totalPages,
@@ -479,7 +536,11 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
 }
 
 function statusLabel(status: Status) {
-  return status === "ready" ? "APTO" : status === "caution" ? "APTO CON ADVERTENCIAS" : "NO APTO";
+  return status === "ready" ? "APTO PROBABLE PARA RIP" : status === "caution" ? "PRUEBA RIP OBLIGATORIA" : "NO APTO PARA RIP";
+}
+
+function qualityLabel(status: Status) {
+  return status === "ready" ? "CALIDAD APROBADA" : status === "caution" ? "CALIDAD A REVISAR" : "CALIDAD INSUFICIENTE";
 }
 
 function ppiLabel(analysis: Analysis) {
@@ -512,7 +573,6 @@ export function PreflightApp() {
     ready: items.filter((item) => item.analysis.status === "ready").length,
     caution: items.filter((item) => item.analysis.status === "caution").length,
     blocked: items.filter((item) => item.analysis.status === "blocked").length,
-    score: items.length ? Math.round(items.reduce((sum, item) => sum + item.analysis.score, 0) / items.length) : 0,
   }), [items]);
   const batchStatus: Status = summary.blocked ? "blocked" : summary.caution ? "caution" : "ready";
 
@@ -575,7 +635,7 @@ export function PreflightApp() {
       `Archivos: ${items.length} · Aptos: ${summary.ready} · Con advertencias: ${summary.caution} · No aptos: ${summary.blocked}`,
       "",
       ...items.flatMap(({ analysis }) => [
-        `${analysis.fileName} — ${statusLabel(analysis.status)}`,
+        `${analysis.fileName} — Compatibilidad: ${statusLabel(analysis.status)} · ${qualityLabel(analysis.qualityStatus)}`,
         `Formato: ${analysis.format} · Páginas: ${analysis.pages ?? "—"} · Tamaño: ${analysis.dimensions.join(" / ") || "—"}`,
         `PPI reales: ${ppiLabel(analysis)} · Perfil: ${analysis.profileName}`,
         `Color: ${analysis.colorSpaces.join(" + ") || "No concluyente"} · Colores visuales: ${analysis.dominantColors.join(", ") || "—"}`,
@@ -633,8 +693,8 @@ export function PreflightApp() {
           </div>
 
           <div className={`batch-banner ${batchStatus}`}>
-            <div><p className="result-label">RESULTADO DEL LOTE</p><h1>{batchStatus === "blocked" ? `${summary.blocked} archivo${summary.blocked === 1 ? " no está apto" : "s no están aptos"}` : batchStatus === "caution" ? "Aptos para RIP con controles" : "Todos aptos para RIP"}</h1><p>{items.length} archivo{items.length === 1 ? "" : "s"} comparado{items.length === 1 ? "" : "s"} contra un objetivo de {PROFILES[profile].dpi} ppp efectivos.</p></div>
-            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Aptos</span><span className="count-caution"><b>{summary.caution}</b>Advertencias</span><span className="count-blocked"><b>{summary.blocked}</b>No aptos</span><span className="count-score"><b>{summary.score}</b>/100</span></div>
+            <div><p className="result-label">COMPATIBILIDAD DEL LOTE</p><h1>{batchStatus === "blocked" ? `${summary.blocked} archivo${summary.blocked === 1 ? " no es interpretable" : "s no son interpretables"}` : batchStatus === "caution" ? "Hay archivos que exigen prueba en RIP" : "Sin bloqueos RIP detectados"}</h1><p>{items.length} archivo{items.length === 1 ? "" : "s"} comparado{items.length === 1 ? "" : "s"}. La calidad se informa por separado para no confundir resolución/color con compatibilidad.</p></div>
+            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Aptos probables</span><span className="count-caution"><b>{summary.caution}</b>Prueba obligatoria</span><span className="count-blocked"><b>{summary.blocked}</b>No aptos</span></div>
           </div>
 
           {working && <div className="inline-progress"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /><p>Analizando {progress.name} · {progress.done}/{progress.total}</p></div>}
@@ -646,7 +706,7 @@ export function PreflightApp() {
           {selected && <FileDetail analysis={selected.analysis} targetPpi={PROFILES[profile].dpi} />}
           {items.length > 1 && <Comparison items={items} />}
 
-          <section className="rip-checklist"><div><p className="kicker">DECISIÓN DE PRODUCCIÓN</p><h2>Apto significa que el RIP puede procesarlo</h2><p>Las advertencias señalan diferencias que pueden cambiar calidad o color. Un archivo “No apto” tiene un bloqueo estructural o una imagen crítica por debajo de 100 ppp.</p></div><ol><li><span>1</span><div><b>ICC de producción</b><small>Debe coincidir con tinta, papel y sustrato</small></div></li><li><span>2</span><div><b>300 ppp ideales</b><small>Medidos al tamaño real de colocación</small></div></li><li><span>3</span><div><b>Espejo una sola vez</b><small>En el archivo o en el RIP</small></div></li><li><span>4</span><div><b>Prueba física</b><small>Confirma color y transferencia</small></div></li></ol></section>
+          <section className="rip-checklist"><div><p className="kicker">DECISIÓN DE PRODUCCIÓN</p><h2>Compatibilidad y calidad no son lo mismo</h2><p>Un archivo puede abrir en el RIP y tener mala resolución; también puede verse perfecto y contener capas, XFA o filtros que el RIP instalado no interpreta. Por eso ahora se informan por separado y sin puntuación artificial.</p></div><ol><li><span>1</span><div><b>Compatibilidad RIP</b><small>Estructura y funciones PDF de riesgo</small></div></li><li><span>2</span><div><b>Calidad de impresión</b><small>PPI, perfil, color y sobreimpresión</small></div></li><li><span>3</span><div><b>Espejo una sola vez</b><small>En el archivo o en el RIP</small></div></li><li><span>4</span><div><b>Prueba física</b><small>Confirma color y transferencia</small></div></li></ol></section>
           <p className="disclaimer">RIPcheck inspecciona los datos PDF reales en el navegador. La similitud visual compara la primera página; el PPI, texto y tamaños se analizan hasta 100 páginas por archivo.</p>
         </section>
       ) : null}
@@ -656,8 +716,10 @@ export function PreflightApp() {
 
 function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: number }) {
   const groups = {
-    errors: analysis.checks.filter((check) => check.severity === "error"),
-    warnings: analysis.checks.filter((check) => check.severity === "warning" || check.severity === "info"),
+    ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
+    ripWarnings: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "warning"),
+    quality: analysis.checks.filter((check) => check.scope === "quality" && (check.severity === "error" || check.severity === "warning")),
+    information: analysis.checks.filter((check) => check.severity === "info"),
     passes: analysis.checks.filter((check) => check.severity === "pass"),
   };
   return <section className="file-detail">
@@ -667,7 +729,7 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
       <div className="color-readout"><span>COLORES VISUALES DETECTADOS</span><div>{analysis.dominantColors.length ? analysis.dominantColors.map((color) => <i key={color} style={{ backgroundColor: color }} title={color} />) : <small>No concluyente</small>}</div><small>Colores dominantes renderizados de la primera página</small></div>
     </div>
     <div className="technical-column">
-      <div className={`single-status ${analysis.status}`}><span>{statusLabel(analysis.status)}</span><b>{analysis.score}/100</b></div>
+      <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
       <div className="metric-grid">
         <Metric label="PPI EFECTIVOS" value={ppiLabel(analysis)} hint={`Objetivo ${targetPpi} ppp`} tone={analysis.ppiMin !== null && analysis.ppiMin < 100 ? "bad" : analysis.ppiMin !== null && analysis.ppiMin < targetPpi ? "warn" : "good"} />
         <Metric label="PERFIL DEL ARCHIVO" value={analysis.profileName} hint="ICC / intención de salida" />
@@ -678,7 +740,7 @@ function FileDetail({ analysis, targetPpi }: { analysis: Analysis; targetPpi: nu
       </div>
       {analysis.spotColors.length > 0 && <div className="spot-line"><span>Tintas directas</span><b>{analysis.spotColors.join(" · ")}</b></div>}
       {analysis.hasText && <div className="text-sample"><span>TEXTO DETECTADO</span><p>{analysis.textPreview || "Texto presente sin contenido extraíble."}</p><small>{analysis.fontNames.length ? `Fuentes: ${analysis.fontNames.join(", ")}` : "Fuentes sin nombre legible"}</small></div>}
-      <div className="checklist compact">{groups.errors.length > 0 && <CheckGroup title="Problemas bloqueantes" checks={groups.errors} tone="error" />}{groups.warnings.length > 0 && <CheckGroup title="Requiere confirmación" checks={groups.warnings} tone="warning" />}{groups.passes.length > 0 && <CheckGroup title="Controles aprobados" checks={groups.passes} tone="pass" />}</div>
+      <div className="checklist compact">{groups.ripErrors.length > 0 && <CheckGroup title="Bloqueos de compatibilidad RIP" checks={groups.ripErrors} tone="error" />}{groups.ripWarnings.length > 0 && <CheckGroup title="Riesgos que exigen prueba en RIP" checks={groups.ripWarnings} tone="warning" />}{groups.quality.length > 0 && <CheckGroup title="Problemas de calidad de impresión" checks={groups.quality} tone={groups.quality.some((check) => check.severity === "error") ? "error" : "warning"} />}{groups.information.length > 0 && <CheckGroup title="Alcance del análisis" checks={groups.information} tone="warning" />}{groups.passes.length > 0 && <CheckGroup title="Controles aprobados" checks={groups.passes} tone="pass" />}</div>
     </div>
   </section>;
 }
@@ -690,7 +752,8 @@ function Metric({ label, value, hint, tone }: { label: string; value: string; hi
 function Comparison({ items }: { items: BatchItem[] }) {
   const base = items[0].analysis;
   const rows = [
-    { label: "Resultado RIP", get: (a: Analysis) => statusLabel(a.status) },
+    { label: "Compatibilidad RIP", get: (a: Analysis) => statusLabel(a.status) },
+    { label: "Calidad de impresión", get: (a: Analysis) => qualityLabel(a.qualityStatus) },
     { label: "PPI reales", get: ppiLabel },
     { label: "Perfil ICC", get: (a: Analysis) => a.profileName },
     { label: "Espacios de color", get: (a: Analysis) => a.colorSpaces.join(" + ") || "No concluyente" },
