@@ -47,8 +47,9 @@ next-env.d.ts
 .devserver.err.log
 .devserver.pid
 
-# salida de compilacion del ejecutable
+# salida de compilacion: se regenera con npm run make:exe y supera el limite
+# de 100 MB por archivo que impone GitHub
 /dist-app*/
-# instaladores y el certificado de firma: nunca van a un repo publico
-/release/
-*.pfx
+/release/win-unpacked/
+/release/*.exe
+/release/*.zip
