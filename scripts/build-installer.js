@@ -17,6 +17,19 @@ const makensisPath = path.resolve(
 
 if (!fs.existsSync(distAppDir)) {
   console.error(`Dist app directory not found: ${distAppDir}`);
+  console.error('Run `npm run make:exe`, which packages the app before building the installer.');
+  process.exit(1);
+}
+
+// NSIS no viene con npm: lo descarga electron-builder y queda en una cache
+// local de Windows. Sin eso, makensis no existe y el error es incomprensible.
+if (!fs.existsSync(makensisPath)) {
+  console.error('NSIS not found, so the installer cannot be compiled.');
+  console.error(`Expected it at: ${makensisPath}`);
+  console.error('It is downloaded on demand by electron-builder. To fetch it once, run:');
+  console.error('  npx electron-builder --win nsis');
+  console.error('The packaged application is already available at:');
+  console.error(`  ${distAppDir}`);
   process.exit(1);
 }
 
