@@ -36,14 +36,18 @@ function decodeAscii85(source: Uint8Array) {
   return new Uint8Array(output);
 }
 
-function rawPdfStreams(bytes: Uint8Array, raw: string) {
-  const streams: Array<{ dictionary: string; source: Uint8Array }> = [];
+export type RawPdfStream = { dictionary: string; source: Uint8Array; objectNumber: number | null };
+
+export function rawPdfStreams(bytes: Uint8Array, raw: string) {
+  const streams: RawPdfStream[] = [];
   const streamPattern = /(?<!end)stream\r?\n/g;
   let match: RegExpExecArray | null;
   while ((match = streamPattern.exec(raw)) && streams.length < 400) {
     const start = match.index + match[0].length;
     const previousObjectEnd = raw.lastIndexOf("endobj", match.index);
     const dictionary = raw.slice(Math.max(previousObjectEnd + 6, match.index - 64 * 1024), match.index);
+    const headerMatches = Array.from(dictionary.matchAll(/(\d+)\s+\d+\s+obj\b/g));
+    const objectNumber = headerMatches.length ? Number(headerMatches[headerMatches.length - 1][1]) : null;
     const endMarker = raw.indexOf("endstream", start);
     if (endMarker < 0) continue;
     const directLength = dictionary.match(/\/Length\s+(\d+)\s*(?:>>|\/)/)?.[1];
@@ -54,12 +58,12 @@ function rawPdfStreams(bytes: Uint8Array, raw: string) {
     const streamLength = directLength || indirectLength;
     const end = streamLength ? Math.min(bytes.length, start + Number(streamLength)) : endMarker;
     if (end <= start || end - start > 20 * 1024 * 1024) continue;
-    streams.push({ dictionary, source: bytes.slice(start, end) });
+    streams.push({ dictionary, source: bytes.slice(start, end), objectNumber });
   }
   return streams;
 }
 
-async function decodePdfStream(source: Uint8Array, dictionary: string) {
+export async function decodePdfStream(source: Uint8Array, dictionary: string) {
   let decoded = source;
   if (/\/ASCII85Decode\b/.test(dictionary)) decoded = decodeAscii85(decoded);
   if (/\/FlateDecode\b/.test(dictionary) && typeof DecompressionStream !== "undefined") {
@@ -147,7 +151,7 @@ export async function embeddedIccProfiles(bytes: Uint8Array, raw: string) {
   return Array.from(profiles);
 }
 
-function indirectObjects(raw: string) {
+export function indirectObjects(raw: string) {
   const objects = new Map<number, string>();
   const headers = Array.from(raw.matchAll(/(?:^|[\r\n])(\d+)\s+(\d+)\s+obj\b/g));
   headers.forEach((match, index) => {

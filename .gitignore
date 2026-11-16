@@ -46,3 +46,9 @@ next-env.d.ts
 .devserver.log
 .devserver.err.log
 .devserver.pid
+
+# salida de compilacion del ejecutable
+/dist-app*/
+# instaladores y el certificado de firma: nunca van a un repo publico
+/release/
+*.pfx

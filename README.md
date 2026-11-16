@@ -1,98 +1,78 @@
-# vinext-starter
+# RIPcheck
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Preflight de archivos PDF para un taller de impresión: sublimación, DTF y gran
+formato. Abrís el archivo, te dice si hay algo para corregir antes de mandarlo
+al RIP, y te marca en la vista previa dónde está cada cosa.
 
-## Prerequisites
+Todo el análisis corre en la máquina. Ningún archivo sale del equipo.
 
-- Node.js `>=22.13.0`
+## Qué revisa
 
-## Quick Start
+Solo avisa lo que cambia lo que hay que hacer. Si no aparece ninguna alerta, el
+archivo no tiene nada raro.
+
+- **Color fuera de CMYK.** El taller imprime todo en CMYK; cualquier RGB que
+  quede en el arte lo convierte el RIP por su cuenta y desentona con el resto.
+  Detecta RGB en vectores, en imágenes colocadas y en paletas indexadas.
+- **Transparencias y sombras.** Las ubica sobre la página y explica que el RIP
+  las tiene que aplanar, que es donde suelen aparecer recuadros claros.
+- **Imágenes con poca definición.** Calcula los puntos por pulgada reales al
+  tamaño en que está colocada cada imagen, no los que dice el archivo.
+- **Tintas directas.** Las lista con el espacio al que caen si el RIP no las
+  reconoce, y avisa si quedaron atrapadas dentro de un ráster, donde no se
+  pueden mapear.
+- **Contornos de corte.** Verifica el nombre exacto que espera Flexi y
+  PhotoPRINT, y que estén aplicados como trazo y no como relleno.
+- **Espejo inconsistente.** Cuando parte del arte viene reflejado y parte no.
+- **Archivos que el RIP no va a poder abrir.** Estructura dañada, compresión
+  rara, formularios, capas rotas, JPEG 2000.
+
+## Qué informa sin alarma
+
+La medida real de la pieza, ya con el factor de escala del documento aplicado.
+El perfil ICC que trae y si viaja entero adentro o es apenas una etiqueta.
+Páginas, texto, fuentes, capas y versión del PDF.
+
+## Lectura de perfiles ICC
+
+Incluye un lector propio de perfiles ICC v2 y v4 que no depende de ninguna
+librería: cabecera de 128 bytes, tabla de etiquetas, descripciones en `desc`
+y `mluc`, y detección de perfiles conocidos. Reporta si el perfil trae las
+tablas de conversión reales o solo etiquetas.
+
+## Desarrollo
+
+Requiere Node 22.13 o superior.
 
 ```bash
 npm install
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+Otros comandos:
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm test          # compila y corre las pruebas
+npm run lint      # eslint
+npm run build     # compila la aplicación web
+npm run make:exe  # arma el instalador de Windows
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+## Cómo está hecho
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+React sobre Vite para la interfaz, `pdfjs-dist` para interpretar el PDF, y
+Electron para empaquetarlo como aplicación de escritorio de Windows. El
+análisis está separado de la interfaz:
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+| Archivo | Qué hace |
+| --- | --- |
+| `app/icc.ts` | Lector de perfiles ICC |
+| `app/pdf-deep.ts` | Lectura profunda del PDF: intenciones de salida, cajas de página, tintas directas |
+| `app/pdf-structure.ts` | Flujos, objetos y colores originales del documento |
+| `app/findings.ts` | Las alertas, con la zona de la página donde está cada una |
+| `app/preflight-rules.ts` | Los datos del archivo y la lectura del ICC |
+| `app/preflight-app.tsx` | La interfaz |
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+## Licencia
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+Sin licencia declarada. Todos los derechos reservados.

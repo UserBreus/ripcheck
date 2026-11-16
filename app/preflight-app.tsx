@@ -2,13 +2,13 @@
 
 import { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { decodedContentStreams, embeddedIccProfiles, extractSourceColorOccurrences, extractSourceColors, inspectPdfStructure, resolveOriginalColorOccurrence, type LayerState, type PdfColorOccurrence, type PdfSourceColor } from "./pdf-structure";
+import { collectIccUsages, expandObjectStreams, readImageColorSpaces, readOutputIntents, readPageGeometry, readPdfXStamp, readSpotInks, scanRiskFeatures, type IccUsage, type OutputIntent, type PageBoxes, type RiskFeatures, type SpotInk } from "./pdf-deep";
+import { fileFacts, iccVerdict, type Fact, type IccVerdict } from "./preflight-rules";
+import { buildFindings, type Finding } from "./findings";
 
-type Severity = "pass" | "warning" | "error" | "info";
 type Status = "ready" | "caution" | "blocked";
 type Matrix = [number, number, number, number, number, number];
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
-
-type Check = { id: string; title: string; detail: string; severity: Severity; value?: string; scope?: "rip" | "quality" | "info" };
 type Metadata = { title: string; author: string; creator: string; producer: string; created: string };
 type PdfPaintRegion = {
   id: string;
@@ -19,20 +19,33 @@ type PdfPaintRegion = {
   fillRule: "nonzero" | "evenodd";
   strokeWidth: number;
   order: number;
+  /** Opacidad aplicada al pintar el objeto (1 = opaco). */
+  alpha: number;
+  /** Modo de fusión distinto de Normal, si lo hay. */
+  blend: string | null;
+  /** El objeto se pinta a través de una máscara suave (sombras, degradados). */
+  softMask: boolean;
+  /** Caja del objeto en coordenadas de página normalizadas (0 a 1). */
+  bbox: Rect;
+  /** PPI efectivos, solo para imágenes ráster. */
+  ppi: number | null;
 };
+
+/** Zona de la página, en fracciones de 0 a 1 desde la esquina superior izquierda. */
+type Rect = { x: number; y: number; w: number; h: number };
 
 type Analysis = {
   id: string;
   fileName: string;
   fileSize: number;
   status: Status;
-  qualityStatus: Status;
   format: string;
   pdfVersion: string | null;
   pages: number | null;
   pagesAnalyzed: number;
   dimensions: string[];
-  checks: Check[];
+  findings: Finding[];
+  facts: Fact[];
   colorSpaces: string[];
   dominantColors: string[];
   sourceColors: PdfSourceColor[];
@@ -53,10 +66,33 @@ type Analysis = {
   missingFontResources: string[];
   formXObjectCount: number;
   iccProfileCount: number;
+  iccVerdict: IccVerdict;
+  iccProfiles: IccProfileSummary[];
+  outputIntents: OutputIntent[];
+  pdfxVersion: string | null;
+  spotInks: SpotInk[];
+  imageColorSpaces: string[];
+  mirrored: { mirrored: number; upright: number };
+  pageGeometry: PageBoxes[];
+  riskFeatures: RiskFeatures | null;
   thumbnail: string | null;
   visualHash: string | null;
   fileHash: string;
   analyzedAt: string;
+};
+
+type IccProfileSummary = {
+  role: string;
+  name: string;
+  space: string;
+  version: string;
+  deviceClass: string;
+  renderingIntent: string;
+  created: string | null;
+  sizeBytes: number;
+  known: string | null;
+  note: string | null;
+  issues: string[];
 };
 
 type BatchItem = { file: File; analysis: Analysis };
@@ -68,7 +104,33 @@ const PROFILES = {
 } as const;
 
 type ProfileKey = keyof typeof PROFILES;
+
+const ICC_ROLE_LABELS: Record<IccUsage["role"], string> = {
+  "output-intent": "Intención de salida",
+  colorspace: "Espacio de trabajo",
+  image: "Imagen",
+  default: "Espacio por defecto",
+  desconocido: "Sin rol declarado",
+};
+
+function summarizeIccUsages(usages: IccUsage[]): IccProfileSummary[] {
+  return usages.map((usage) => ({
+    role: ICC_ROLE_LABELS[usage.role],
+    name: usage.profile?.description || usage.profile?.known?.name || (usage.broken ? "Perfil ilegible" : "Perfil sin nombre"),
+    space: usage.profile?.dataColorSpaceLabel || (usage.declaredComponents ? `${usage.declaredComponents} canales` : "—"),
+    version: usage.profile ? `v${usage.profile.versionLabel}` : "—",
+    deviceClass: usage.profile?.deviceClassLabel || "—",
+    renderingIntent: usage.profile?.renderingIntentLabel || "—",
+    created: usage.profile?.created || null,
+    sizeBytes: usage.profile?.byteLength || 0,
+    known: usage.profile?.known?.name || null,
+    note: usage.profile?.known?.note || null,
+    issues: usage.broken ? ["El flujo no contiene un perfil ICC legible."] : usage.mismatches,
+  }));
+}
 const MAX_FILES = 12;
+/** Tope para dibujar la vista previa de una página antes de seguir sin ella. */
+const PREVIEW_TIMEOUT_MS = 15000;
 const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
 
 const mm = (points: number) => (points * 25.4) / 72;
@@ -145,11 +207,20 @@ function getImagePpi(operatorList: { fnArray: number[]; argsArray: unknown[][] }
   const stack: Matrix[] = [];
   const values: number[] = [];
   let imageCount = 0;
+  let mirrored = 0;
+  let upright = 0;
 
-  const addImage = (width: number, height: number) => {
+  const addImage = (width: number, height: number, stencil = false) => {
     imageCount += 1;
     const placedWidth = Math.hypot(ctm[0], ctm[1]);
     const placedHeight = Math.hypot(ctm[2], ctm[3]);
+    const determinant = ctm[0] * ctm[3] - ctm[1] * ctm[2];
+    // Las máscaras de recorte se dibujan con matrices invertidas por diseño;
+    // solo una imagen real colocada del revés indica un arte espejado.
+    if (!stencil && placedWidth > 2 && placedHeight > 2) {
+      if (determinant < 0) mirrored += 1;
+      else if (determinant > 0) upright += 1;
+    }
     if (width > 0 && height > 0 && placedWidth > 0.05 && placedHeight > 0.05) {
       const x = width / (placedWidth / 72);
       const y = height / (placedHeight / 72);
@@ -169,12 +240,14 @@ function getImagePpi(operatorList: { fnArray: number[]; argsArray: unknown[][] }
     else if (fn === OPS.paintImageXObject) addImage(Number(args[1]) || 0, Number(args[2]) || 0);
     else if (fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
       const image = args[0] as { width?: number; height?: number } | undefined;
-      addImage(Number(image?.width) || 0, Number(image?.height) || 0);
+      addImage(Number(image?.width) || 0, Number(image?.height) || 0, fn === OPS.paintImageMaskXObject);
     }
   });
 
-  return { values, imageCount };
+  return { values, imageCount, mirrored, upright };
 }
+
+/** Detecta un rectángulo de fondo que cubra prácticamente toda la página. */
 
 function paintRegions(
   operatorList: { fnArray: number[]; argsArray: unknown[][] },
@@ -182,8 +255,8 @@ function paintRegions(
   viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): [number, number] },
   colorOccurrences: PdfColorOccurrence[],
 ) {
-  type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null; lineWidth: number; textMatrix: Matrix; fontSize: number };
-  let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null, lineWidth: 1, textMatrix: [...IDENTITY], fontSize: 12 };
+  type PaintState = { ctm: Matrix; fillColorId: string | null; strokeColorId: string | null; lineWidth: number; textMatrix: Matrix; fontSize: number; fillAlpha: number; strokeAlpha: number; blend: string | null; softMask: boolean };
+  let state: PaintState = { ctm: [...IDENTITY], fillColorId: null, strokeColorId: null, lineWidth: 1, textMatrix: [...IDENTITY], fontSize: 12, fillAlpha: 1, strokeAlpha: 1, blend: null, softMask: false };
   const stack: PaintState[] = [];
   const regions: PdfPaintRegion[] = [];
   const occurrenceQueues = {
@@ -208,11 +281,33 @@ function paintRegions(
     const numbers = Array.from({ length: 6 }, (_, index) => Number(matrix[index])) as Matrix;
     return numbers.every(Number.isFinite) ? numbers : null;
   };
-  const project = (x: number, y: number, matrix: Matrix = state.ctm) => {
+  // Caja del objeto que se está construyendo, para poder señalarlo después
+  // sobre la vista previa. Se lleva como cuatro números y no como lista de
+  // puntos: los trazados de recorte nunca se pintan y acumularlos colgaba el
+  // navegador en archivos con miles de contornos.
+  let minX = 1, minY = 1, maxX = 0, maxY = 0, tracked = false;
+  const resetBounds = () => { minX = 1; minY = 1; maxX = 0; maxY = 0; tracked = false; };
+  const transform = (x: number, y: number, matrix: Matrix) => {
     const transformedX = matrix[0] * x + matrix[2] * y + matrix[4];
     const transformedY = matrix[1] * x + matrix[3] * y + matrix[5];
     const point = viewport.convertToViewportPoint(transformedX, transformedY);
     return [point[0] / viewport.width, point[1] / viewport.height] as const;
+  };
+  const project = (x: number, y: number, matrix: Matrix = state.ctm) => {
+    const normalized = transform(x, y, matrix);
+    if (normalized[0] < minX) minX = normalized[0];
+    if (normalized[1] < minY) minY = normalized[1];
+    if (normalized[0] > maxX) maxX = normalized[0];
+    if (normalized[1] > maxY) maxY = normalized[1];
+    tracked = true;
+    return normalized;
+  };
+  const takeBounds = (): Rect => {
+    if (!tracked) return { x: 0, y: 0, w: 0, h: 0 };
+    const clamp = (value: number) => Math.min(1, Math.max(0, value));
+    const box = { x: clamp(minX), y: clamp(minY), w: clamp(maxX) - clamp(minX), h: clamp(maxY) - clamp(minY) };
+    resetBounds();
+    return box;
   };
   const format = (number: number) => Number(number.toFixed(6));
   const pathFromEncoded = (encoded: ArrayLike<number>) => {
@@ -238,14 +333,24 @@ function paintRegions(
     return `${index ? "L" : "M"}${format(point[0])} ${format(point[1])}`;
   }).join(" ") + " Z";
   const normalizedLineWidth = () => {
-    const origin = project(0, 0);
-    const horizontal = project(state.lineWidth, 0);
-    const vertical = project(0, state.lineWidth);
+    const origin = transform(0, 0, state.ctm);
+    const horizontal = transform(state.lineWidth, 0, state.ctm);
+    const vertical = transform(0, state.lineWidth, state.ctm);
     return Math.max(Math.hypot(horizontal[0] - origin[0], horizontal[1] - origin[1]), Math.hypot(vertical[0] - origin[0], vertical[1] - origin[1]), 0.0015);
   };
-  const addRegion = (d: string, colorId: string | null, kind: PdfPaintRegion["kind"], paint: PdfPaintRegion["paint"], fillRule: PdfPaintRegion["fillRule"] = "nonzero") => {
+  const addRegion = (d: string, colorId: string | null, kind: PdfPaintRegion["kind"], paint: PdfPaintRegion["paint"], fillRule: PdfPaintRegion["fillRule"] = "nonzero", ppi: number | null = null) => {
+    const bbox = takeBounds();
     if (!d || regions.length >= 10000) return;
-    regions.push({ id: `${kind}-${regions.length}`, colorId, kind, d, paint, fillRule, strokeWidth: paint === "stroke" ? normalizedLineWidth() : 0, order: regions.length });
+    const strokeWidth = paint === "stroke" ? normalizedLineWidth() : 0;
+    regions.push({
+      id: `${kind}-${regions.length}`,
+      colorId, kind, d, paint, fillRule, strokeWidth, order: regions.length,
+      alpha: paint === "stroke" ? state.strokeAlpha : state.fillAlpha,
+      blend: state.blend,
+      softMask: state.softMask,
+      bbox,
+      ppi,
+    });
   };
 
   operatorList.fnArray.forEach((fn, index) => {
@@ -258,6 +363,32 @@ function paintRegions(
       state.ctm = multiply(state.ctm, matrixFrom(args[0])!);
     } else if (fn === OPS.paintFormXObjectEnd) state = stack.pop() || state;
     else if (fn === OPS.setLineWidth) state.lineWidth = Math.max(0, Number(args[0]) || 0);
+    else if (fn === OPS.setGState && Array.isArray(args[0])) {
+      // El estado gráfico trae la opacidad, el modo de fusión y la máscara
+      // suave: es de donde salen las transparencias y las sombras.
+      for (const entry of args[0] as Array<[string, unknown]>) {
+        if (!Array.isArray(entry)) continue;
+        const [key, value] = entry;
+        if (key === "ca") state.fillAlpha = Number.isFinite(Number(value)) ? Number(value) : state.fillAlpha;
+        else if (key === "CA") state.strokeAlpha = Number.isFinite(Number(value)) ? Number(value) : state.strokeAlpha;
+        else if (key === "BM") {
+          // PDF.js entrega el modo ya traducido al nombre que usa el lienzo:
+          // "source-over" es el modo Normal. Compararlo contra "Normal"
+          // marcaba como fusión a todos los objetos del documento.
+          const source = Array.isArray(value) ? value[0] : value;
+          const mode = typeof source === "string"
+            ? source
+            : source && typeof source === "object" && "name" in source
+              ? String((source as { name: unknown }).name)
+              : "";
+          state.blend = mode && !/^(?:normal|source-over|compatible)$/i.test(mode) ? mode : null;
+        } else if (key === "SMask") {
+          const source = Array.isArray(value) ? value[0] : value;
+          state.softMask = !!source && String(source).toLowerCase() !== "none";
+        }
+        else if (key === "LW") state.lineWidth = Math.max(0, Number(value) || 0);
+      }
+    }
     else if (fn === OPS.setFillRGBColor || fn === OPS.setFillCMYKColor || fn === OPS.setFillGray || fn === OPS.setFillColor || fn === OPS.setFillColorN) state.fillColorId = colorIdFromArgs(args, "fill");
     else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeCMYKColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeColor || fn === OPS.setStrokeColorN) state.strokeColorId = colorIdFromArgs(args, "stroke");
     else if (fn === OPS.setFillTransparent) state.fillColorId = null;
@@ -270,6 +401,7 @@ function paintRegions(
       state.textMatrix[5] += Number(args[1]) || 0;
     }
     else if (fn === OPS.constructPath) {
+      resetBounds();
       const paint = Number(args[0]);
       const data = args[1] as ArrayLike<ArrayLike<number>> | undefined;
       const d = data?.[0] ? pathFromEncoded(data[0]) : "";
@@ -277,7 +409,20 @@ function paintRegions(
       if ([OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(d, state.fillColorId, "vector", "fill", evenOdd ? "evenodd" : "nonzero");
       if ([OPS.stroke, OPS.closeStroke, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].includes(paint)) addRegion(d, state.strokeColorId, "vector", "stroke");
     } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject || fn === OPS.paintSolidColorImageMask) {
-      addRegion(polygon([[0, 0], [1, 0], [1, 1], [0, 1]]), null, "raster", "fill");
+      const inline = args[0] as { width?: number; height?: number } | undefined;
+      const pixelWidth = fn === OPS.paintImageXObject ? Number(args[1]) || 0 : Number(inline?.width) || 0;
+      const pixelHeight = fn === OPS.paintImageXObject ? Number(args[2]) || 0 : Number(inline?.height) || 0;
+      const placedWidth = Math.hypot(state.ctm[0], state.ctm[1]);
+      const placedHeight = Math.hypot(state.ctm[2], state.ctm[3]);
+      let ppi: number | null = null;
+      if (pixelWidth > 0 && pixelHeight > 0 && placedWidth > 0.05 && placedHeight > 0.05) {
+        const horizontal = pixelWidth / (placedWidth / 72);
+        const vertical = pixelHeight / (placedHeight / 72);
+        if (Number.isFinite(horizontal) && Number.isFinite(vertical) && horizontal < 100000 && vertical < 100000) {
+          ppi = Math.round(Math.min(horizontal, vertical));
+        }
+      }
+      addRegion(polygon([[0, 0], [1, 0], [1, 1], [0, 1]]), null, "raster", "fill", "nonzero", ppi);
     } else if (fn === OPS.showText || fn === OPS.showSpacedText || fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
       const glyphs = Array.isArray(args[0]) ? args[0] : [];
       let advance = 0;
@@ -340,24 +485,36 @@ async function renderFirstPage(page: Awaited<ReturnType<Awaited<ReturnType<PdfJs
   canvas.width = Math.max(1, Math.floor(viewport.width));
   canvas.height = Math.max(1, Math.floor(viewport.height));
   const context = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
-  if (!context) return { thumbnail: null, visualHash: null, colors: [] as string[] };
-  await page.render({ canvas, canvasContext: context, viewport }).promise;
+  const empty = { thumbnail: null, visualHash: null, colors: [] as string[] };
+  if (!context) return empty;
+
+  const task = page.render({ canvas, canvasContext: context, viewport });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const drawn = await Promise.race([
+    task.promise.then(() => true).catch(() => false),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), PREVIEW_TIMEOUT_MS); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (!drawn) {
+    try { task.cancel(); } catch { /* la tarea ya estaba terminada */ }
+    return empty;
+  }
   return { thumbnail: canvas.toDataURL("image/jpeg", 0.82), visualHash: differenceHash(canvas), colors: dominantColors(canvas) };
 }
 
-function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
+function emptyAnalysis(file: File, fileHash: string, blocker: { id: string; title: string; detail: string }): Analysis {
   return {
     id: `${file.name}-${file.size}-${file.lastModified}`,
     fileName: file.name,
     fileSize: file.size,
     status: "blocked",
-    qualityStatus: "blocked",
     format: file.name.toLowerCase().endsWith(".ai") ? "Illustrator nativo" : "No reconocido",
     pdfVersion: null,
     pages: null,
     pagesAnalyzed: 0,
     dimensions: [],
-    checks: [{ ...check, scope: check.scope || "rip" }],
+    findings: [{ ...blocker, severity: "error", badge: "No se puede usar", rects: [], count: 1 }],
+    facts: [],
     colorSpaces: [],
     dominantColors: [],
     sourceColors: [],
@@ -378,6 +535,15 @@ function emptyAnalysis(file: File, fileHash: string, check: Check): Analysis {
     missingFontResources: [],
     formXObjectCount: 0,
     iccProfileCount: 0,
+    iccVerdict: { state: "sin-icc", label: "Sin análisis", summary: "El archivo no pudo abrirse, así que no se leyó el color." },
+    iccProfiles: [],
+    outputIntents: [],
+    pdfxVersion: null,
+    spotInks: [],
+    imageColorSpaces: [],
+    mirrored: { mirrored: 0, upright: 0 },
+    pageGeometry: [],
+    riskFeatures: null,
     thumbnail: null,
     visualHash: null,
     fileHash,
@@ -393,31 +559,35 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   const isPdf = /^%PDF-/.test(raw.slice(0, 16));
 
   if (!isPdf) return emptyAnalysis(file, fileHash, {
-    id: "structure",
-    title: extension === "ai" ? "AI sin compatibilidad PDF" : "Archivo no reconocido como PDF",
-    detail: extension === "ai" ? "Guarda nuevamente el AI activando “Crear archivo compatible con PDF”. Sin esa representación no es seguro enviarlo al RIP." : "La firma del archivo no corresponde a un PDF válido.",
-    severity: "error",
-    scope: "rip",
-    value: "NO APTO",
+    id: "no-es-pdf",
+    title: extension === "ai" ? "El AI no trae versión PDF adentro" : "El archivo no es un PDF",
+    detail: extension === "ai"
+      ? "Volvé a guardar el AI con la opción “Crear archivo compatible con PDF” tildada. Sin eso, adentro no hay nada que el RIP pueda leer."
+      : "El contenido no arranca como un PDF. Puede estar cortado, mal descargado o ser otro formato con el nombre cambiado.",
   });
 
   if (/\/Encrypt\b/.test(raw)) return emptyAnalysis(file, fileHash, {
-    id: "security",
-    title: "Documento protegido o cifrado",
-    detail: "Quita la contraseña y las restricciones antes de enviarlo a producción.",
-    severity: "error",
-    scope: "rip",
-    value: "NO APTO",
+    id: "protegido",
+    title: "El archivo tiene contraseña",
+    detail: "Está protegido y no se puede leer el contenido. Pedí el archivo sin contraseña.",
   });
-
   const contentText = await decodedContentStreams(bytes, raw);
-  const inspectionText = `${raw}\n${contentText}`;
+  // Los PDF 1.5+ guardan casi todos los diccionarios comprimidos en /ObjStm.
+  const expandedObjects = await expandObjectStreams(bytes, raw);
+  const structuralRaw = expandedObjects ? `${raw}${expandedObjects}` : raw;
+  const inspectionText = `${structuralRaw}\n${contentText}`;
   const crossReference = validateCrossReference(bytes);
-  const pdfStructure = inspectPdfStructure(raw, contentText);
-  const colorOccurrences = extractSourceColorOccurrences(raw, contentText);
-  const sourceColors = extractSourceColors(raw, contentText, 64);
+  const pdfStructure = inspectPdfStructure(structuralRaw, contentText);
+  const colorOccurrences = extractSourceColorOccurrences(structuralRaw, contentText);
+  const sourceColors = extractSourceColors(structuralRaw, contentText, 64);
   const embeddedProfiles = await embeddedIccProfiles(bytes, raw);
-
+  const iccUsages = await collectIccUsages(bytes, raw, structuralRaw);
+  const outputIntents = readOutputIntents(structuralRaw);
+  const pdfx = readPdfXStamp(structuralRaw);
+  const pageGeometry = readPageGeometry(structuralRaw);
+  const spotInks = readSpotInks(structuralRaw, contentText);
+  const riskFeatures = scanRiskFeatures(structuralRaw, contentText);
+  const imageColorSpaces = readImageColorSpaces(structuralRaw);
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
   let pdf: Awaited<ReturnType<typeof pdfjs.getDocument>["promise"]>;
@@ -425,12 +595,9 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     pdf = await pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
   } catch {
     return emptyAnalysis(file, fileHash, {
-      id: "parse",
-      title: "El documento no puede interpretarse",
-      detail: "La estructura está dañada o utiliza características que impiden abrirla de forma confiable.",
-      severity: "error",
-      scope: "rip",
-      value: "NO APTO",
+      id: "ilegible",
+      title: "El archivo no se puede abrir",
+      detail: "Está dañado o usa algo que no se puede leer. Pedí que lo vuelvan a exportar.",
     });
   }
 
@@ -447,12 +614,13 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
   let visualHash: string | null = null;
   let detectedColors: string[] = [];
   let firstPagePaintRegions: PdfPaintRegion[] = [];
+  let mirroredPlacements = 0;
+  let uprightPlacements = 0;
 
   for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale: 1 });
     dimensions.add(`${mm(viewport.width).toFixed(1)} × ${mm(viewport.height).toFixed(1)} mm`);
-
     const text = await page.getTextContent();
     for (const item of text.items) {
       if (!("str" in item)) continue;
@@ -464,11 +632,12 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
         fontNames.add(style?.fontFamily || item.fontName);
       }
     }
-
     const operators = await page.getOperatorList();
     const imageResult = getImagePpi(operators, pdfjs.OPS);
     imageCount += imageResult.imageCount;
     ppiValues.push(...imageResult.values);
+    mirroredPlacements += imageResult.mirrored;
+    uprightPlacements += imageResult.upright;
 
     if (pageNumber === 1) {
       firstPagePaintRegions = paintRegions(operators, pdfjs.OPS, viewport, colorOccurrences);
@@ -479,7 +648,6 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     }
     page.cleanup();
   }
-
   const pdfMetadata = await pdf.getMetadata().catch(() => null);
   const info = (pdfMetadata?.info || {}) as Record<string, unknown>;
   const metadata: Metadata = {
@@ -490,123 +658,113 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     created: String(info.CreationDate || ""),
   };
 
+  // El espacio de color se deduce de los diccionarios del PDF y de los
+  // operadores ya descomprimidos. Buscarlo en el archivo crudo daba falsos
+  // positivos, porque los flujos comprimidos son binario y cualquier byte
+  // puede parecerse a un operador de color.
+  const usesSpace = (space: "CMYK" | "RGB" | "Gray") => colorOccurrences.some((color) => color.space === space);
   const colorSpaces: string[] = [];
-  if (/\/DeviceCMYK\b|(?:^|\s)(?:-?\d*\.?\d+\s+){4}[kK](?=\s|$)/m.test(inspectionText)) colorSpaces.push("CMYK");
-  if (/\/DeviceRGB\b|(?:^|\s)(?:-?\d*\.?\d+\s+){3}(?:rg|RG)(?=\s|$)/m.test(inspectionText)) colorSpaces.push("RGB");
-  if (/\/ICCBased\b/.test(inspectionText)) colorSpaces.push("ICC");
-  if (/\/DeviceGray\b|(?:^|\s)-?\d*\.?\d+\s+[gG](?=\s|$)/m.test(inspectionText)) colorSpaces.push("Grises");
-  if (/\/Lab\b/.test(inspectionText)) colorSpaces.push("Lab");
-  if (/\/(?:Separation|DeviceN)\b/.test(inspectionText)) colorSpaces.push("Tintas directas");
+  if (/\/DeviceCMYK\b/.test(structuralRaw) || usesSpace("CMYK")) colorSpaces.push("CMYK");
+  if (/\/(?:DeviceRGB|CalRGB)\b/.test(structuralRaw) || usesSpace("RGB")) colorSpaces.push("RGB");
+  if (/\/ICCBased\b/.test(structuralRaw)) colorSpaces.push("ICC");
+  if (/\/(?:DeviceGray|CalGray)\b/.test(structuralRaw) || usesSpace("Gray")) colorSpaces.push("Grises");
+  if (/\/Lab\b/.test(structuralRaw)) colorSpaces.push("Lab");
+  if (/\/(?:Separation|DeviceN)\b/.test(structuralRaw)) colorSpaces.push("Tintas directas");
+  // El RGB puede estar escondido en la paleta de una imagen indexada.
+  const rgbEnPaleta = /\/Indexed\s*\/?(?:DeviceRGB|CalRGB)\b/.test(structuralRaw);
   const spotColors = uniqueMatches(inspectionText, /\/Separation\s*\/([^\s/<>{}\[\]()]+)/g, 12);
-  const profileName = detectProfile(raw, embeddedProfiles);
+  const profileName = detectProfile(structuralRaw, embeddedProfiles);
   const ppiMin = ppiValues.length ? Math.round(Math.min(...ppiValues)) : null;
   const ppiMax = ppiValues.length ? Math.round(Math.max(...ppiValues)) : null;
   const hasText = textCharacters > 0;
-  const checks: Check[] = [];
 
-  checks.push({ id: "structure", title: extension === "ai" ? "AI compatible con PDF" : "PDF interpretable", detail: `${totalPages} página${totalPages === 1 ? "" : "s"}; PDF ${version || "sin versión legible"}. El motor PDF estándar pudo interpretar ${maxPages === totalPages ? "todas las páginas" : `las primeras ${maxPages} páginas`}.`, severity: "pass", value: "INTERPRETABLE", scope: "rip" });
-
+  // Bloqueos: solo lo que impide de verdad que el archivo se procese.
+  const blockers: Array<{ id: string; title: string; detail: string }> = [];
   if (!crossReference.hasEof || !crossReference.hasStartXref || !crossReference.xrefValid) {
-    checks.push({ id: "xref", title: "Estructura de referencias PDF reparada o inválida", detail: "El visor tolerante pudo abrir el documento, pero falta o no coincide EOF/startxref/xref. Muchos RIP rechazan archivos que un visor común repara automáticamente. Reexporta o imprime a un PDF nuevo.", severity: "error", value: "REEXPORTAR", scope: "rip" });
-  } else if (crossReference.trailingBytes > 1024) {
-    checks.push({ id: "trailing", title: "Datos adicionales después del cierre PDF", detail: "Hay contenido significativo después de %%EOF. Puede ser una actualización válida, pero algunos intérpretes estrictos lo rechazan; conviene reexportar.", severity: "warning", value: "REVISAR", scope: "rip" });
-  } else {
-    checks.push({ id: "xref", title: "Tabla de referencias consistente", detail: "EOF, startxref y el destino de la tabla de referencias son coherentes.", severity: "pass", value: "CORRECTO", scope: "rip" });
+    blockers.push({
+      id: "danado",
+      title: "El archivo está dañado por dentro",
+      detail: "Le falta o no coincide la tabla interna que dice dónde está cada cosa. Un visor común lo repara solo y por eso se ve bien, pero el RIP puede rechazarlo. Abrilo y volvé a guardarlo como PDF nuevo.",
+    });
   }
-
   const filterNames = new Set<string>();
   for (const match of inspectionText.matchAll(/\/Filter\s*\/([A-Za-z0-9]+)/g)) filterNames.add(match[1]);
   for (const match of inspectionText.matchAll(/\/Filter\s*\[([^\]]+)\]/g)) for (const name of match[1].matchAll(/\/([A-Za-z0-9]+)/g)) filterNames.add(name[1]);
   const knownFilters = new Set(["FlateDecode", "Fl", "DCTDecode", "DCT", "JPXDecode", "LZWDecode", "LZW", "ASCII85Decode", "A85", "ASCIIHexDecode", "AHx", "RunLengthDecode", "RL", "CCITTFaxDecode", "CCF", "JBIG2Decode", "Crypt"]);
   const unknownFilters = Array.from(filterNames).filter((name) => !knownFilters.has(name));
-  if (unknownFilters.length) checks.push({ id: "filters", title: `Filtros PDF no estándar: ${unknownFilters.join(", ")}`, detail: "El archivo usa filtros de flujo fuera del conjunto PDF habitual. Reexporta con compresión ZIP/JPEG convencional antes de enviarlo al RIP.", severity: "error", value: "NO COMPATIBLE", scope: "rip" });
-
-  if (imageCount === 0) {
-    checks.push({ id: "ppi", title: "Arte vectorial: PPI no aplica", detail: "No se detectaron imágenes ráster colocadas. Los vectores y textos conservan resolución independiente.", severity: "pass", value: "Vectorial", scope: "quality" });
-  } else if (ppiMin === null) {
-    checks.push({ id: "ppi", title: "PPI efectivos no concluyentes", detail: `Se detectaron ${imageCount} imágenes, pero su transformación no permitió calcular el PPI real. Confírmalo en el preflight del RIP.`, severity: "warning", value: "REVISAR", scope: "quality" });
-  } else if (ppiMin < 100) {
-    checks.push({ id: "ppi", title: `Calidad insuficiente: mínimo ${ppiMin} ppp`, detail: `El archivo puede abrir en un RIP, pero al menos una imagen está por debajo de 100 ppp efectivos y puede pixelarse visiblemente. Objetivo: ${targetPpi} ppp.`, severity: "error", value: "CALIDAD NO APTA", scope: "quality" });
-  } else if (ppiMin < targetPpi) {
-    checks.push({ id: "ppi", title: `Resolución por debajo del objetivo: ${ppiMin}–${ppiMax} ppp`, detail: `Son PPI efectivos calculados con los píxeles y el tamaño real de colocación. Objetivo del trabajo: ${targetPpi} ppp.`, severity: "warning", value: `${ppiMin} ppp mín.`, scope: "quality" });
-  } else {
-    checks.push({ id: "ppi", title: `Resolución efectiva aprobada: ${ppiMin}–${ppiMax} ppp`, detail: `Todas las colocaciones calculables alcanzan el objetivo de ${targetPpi} ppp.`, severity: "pass", value: `${ppiMin} ppp mín.`, scope: "quality" });
-  }
-
-  checks.push({
-    id: "profile",
-    title: profileName === "No declarado" ? "Sin perfil ICC de salida declarado" : `Perfil detectado: ${profileName}`,
-    detail: profileName === "No declarado" ? "El RIP deberá asignar explícitamente el perfil de impresora, tinta, papel y sustrato." : "El archivo trae una referencia de color. Confirma que coincida con el perfil de producción usado por el RIP.",
-    severity: profileName === "No declarado" ? "warning" : "pass",
-    value: profileName,
-    scope: "quality",
-  });
-
-  checks.push({
-    id: "color",
-    title: colorSpaces.length ? `Espacios detectados: ${colorSpaces.join(" + ")}` : "Espacio de color no concluyente",
-    detail: colorSpaces.includes("CMYK") ? (colorSpaces.includes("RGB") ? "El documento mezcla CMYK y RGB. El RIP realizará conversiones; revisa el resultado con el ICC correcto." : "Se detectó contenido CMYK.") : colorSpaces.includes("RGB") ? "Se detectó contenido RGB. Puede ripearse si la gestión de color convierte mediante el ICC de sublimación." : "La compresión interna impide confirmar todo el contenido de color.",
-    severity: colorSpaces.length ? (colorSpaces.includes("CMYK") && colorSpaces.includes("RGB") ? "warning" : "pass") : "warning",
-    value: colorSpaces.join(" · ") || "REVISAR",
-    scope: "quality",
-  });
-
-  const rawFontCount = Array.from(raw.matchAll(/\/BaseFont\s*\//g)).length;
-  const embeddedFontCount = Array.from(raw.matchAll(/\/FontFile\d?\s+/g)).length;
-  if (pdfStructure.missingFontResources.length) {
-    checks.push({
-      id: "font-resources",
-      title: `Referencias tipográficas rotas: ${pdfStructure.missingFontResources.join(", ")}`,
-      detail: "El contenido intenta usar estas fuentes, pero no están declaradas en los recursos PDF. Los visores tolerantes pueden omitir el error; PhotoPRINT puede rechazar el archivo.",
-      severity: "error",
-      value: "NO APTO",
-      scope: "rip",
+  if (unknownFilters.length) {
+    blockers.push({
+      id: "compresion",
+      title: "El archivo usa una compresión rara",
+      detail: "Adentro tiene datos comprimidos de una forma que el RIP no conoce, así que puede no abrirlo. Volvé a exportarlo con compresión normal.",
     });
-  } else if (contentText.match(/\/[^\s/<>{}\[\]()]+\s+[-+]?(?:\d*\.)?\d+\s+Tf\b/)) {
-    checks.push({ id: "font-resources", title: "Recursos tipográficos coherentes", detail: "Las fuentes utilizadas por las instrucciones de texto están declaradas en los recursos del PDF.", severity: "pass", value: "CORRECTO", scope: "rip" });
   }
-  checks.push({
-    id: "fonts",
-    title: hasText ? `${fontNames.size || rawFontCount} fuente${(fontNames.size || rawFontCount) === 1 ? "" : "s"} en texto` : "No contiene texto editable detectable",
-    detail: hasText ? (rawFontCount > 0 && embeddedFontCount === 0 ? "Hay texto, pero no se localizaron datos de fuente incorporada. Incrusta las fuentes o convierte a curvas." : `Texto real detectado (${textCharacters.toLocaleString("es-UY")} caracteres).`) : "El contenido puede estar trazado o rasterizado; no habrá sustitución tipográfica, pero tampoco texto editable.",
-    severity: hasText && rawFontCount > 0 && embeddedFontCount === 0 ? "warning" : "pass",
-    value: hasText ? "SÍ TIENE TEXTO" : "SIN TEXTO",
-    scope: hasText && rawFontCount > 0 && embeddedFontCount === 0 ? "rip" : "quality",
+  if (/\/XFA\b/.test(inspectionText)) {
+    blockers.push({
+      id: "formulario",
+      title: "Es un formulario, no un arte",
+      detail: "El contenido está armado como formulario interactivo y el RIP no lo ve. Imprimilo a un PDF nuevo antes de mandarlo.",
+    });
+  }
+  if (pdfStructure.layerState === "orphaned") {
+    blockers.push({
+      id: "capas",
+      title: "Las capas del archivo están rotas",
+      detail: `Tiene ${pdfStructure.layerCount} capas que no están registradas donde corresponde. Es una inconsistencia que hace que PhotoPRINT rechace el archivo. Aplaná las capas y volvé a exportar.`,
+    });
+  }
+  if (/\/JPXDecode\b/.test(inspectionText)) {
+    blockers.push({
+      id: "jpeg2000",
+      title: "Hay imágenes en JPEG 2000",
+      detail: "Es un formato de imagen que muchos RIP no leen, y donde estén esas imágenes puede quedar un hueco en blanco. Guardalas como JPEG o TIFF normal.",
+    });
+  }
+
+  const rawFontCount = Array.from(structuralRaw.matchAll(/\/BaseFont\s*\//g)).length;
+  const embeddedFontCount = Array.from(structuralRaw.matchAll(/\/FontFile\d?\s+/g)).length;
+
+  const findings = buildFindings({
+    regions: firstPagePaintRegions,
+    targetPpi,
+    document: {
+      blockers,
+      hasRgb: colorSpaces.includes("RGB"),
+      rgbInImages: imageColorSpaces.some((space) => /RGB/i.test(space)),
+      rgbInPalette: rgbEnPaleta,
+      fontsNotEmbedded: hasText && rawFontCount > 0 && embeddedFontCount === 0,
+      missingFontResources: pdfStructure.missingFontResources,
+      minPpi: ppiMin,
+      imageCount,
+      spotInks,
+      mirroredMixed: mirroredPlacements > 0 && uprightPlacements > 0,
+      totalPages,
+    },
   });
 
-  const transparency = /\/SMask\b|\/Group\s*<<[\s\S]{0,180}?\/S\s*\/Transparency\b|\/(?:ca|CA)\s+0?\.[0-9]+/i.test(inspectionText);
-  checks.push({ id: "transparency", title: transparency ? "Transparencias detectadas" : "Sin transparencias detectables", detail: transparency ? "Máscaras, sombras y fusiones pueden fallar en RIP antiguos o con intérpretes PDF limitados. Aplana una copia o haz una prueba obligatoria." : "No se detectaron máscaras o grupos de transparencia en la estructura analizada.", severity: transparency ? "warning" : "pass", value: transparency ? "RIESGO RIP" : "CORRECTO", scope: "rip" });
+  const facts = fileFacts({
+    pdfVersion: version,
+    pages: totalPages,
+    geometry: pageGeometry,
+    colorSpaces,
+    imageColorSpaces,
+    imageCount,
+    ppiMin,
+    ppiMax,
+    hasText,
+    textCharacters,
+    fontNames: Array.from(fontNames),
+    spotInks,
+    iccUsages,
+    outputIntents,
+    pdfxVersion: pdfx.version,
+    layerCount: pdfStructure.layerCount,
+    mirrored: { mirrored: mirroredPlacements, upright: uprightPlacements },
+  });
 
-  if (spotColors.length) checks.push({ id: "spots", title: `Tintas directas: ${spotColors.join(", ")}`, detail: "Un RIP puede rechazar o interpretar distinto DeviceN/Separation. Mapea estas tintas o conviértelas antes de producir.", severity: "warning", value: `${spotColors.length} detectada${spotColors.length === 1 ? "" : "s"}`, scope: "rip" });
-
-  const hasXfa = /\/XFA\b/.test(inspectionText);
-  const hasInteractive = /\/(?:RichMedia|3D|JavaScript|Launch|EmbeddedFile)\b/.test(inspectionText);
-  const hasJpeg2000 = /\/JPXDecode\b/.test(inspectionText);
-  const hasComplexBlend = /\/BM\s*\/(?!Normal\b)[A-Za-z]+/.test(inspectionText);
-  const hasOverprint = /\/(?:OP|op)\s+true\b|\/OPM\s+[12]\b/.test(inspectionText);
-  const isPdf2 = version !== null && Number(version) >= 2;
-
-  if (hasXfa) checks.push({ id: "xfa", title: "Formulario XFA detectado", detail: "XFA no es contenido de página PDF convencional y puede no existir para el intérprete del RIP. Imprime o aplana el archivo a un PDF nuevo antes de producción.", severity: "error", value: "APLANAR", scope: "rip" });
-  if (hasInteractive) checks.push({ id: "interactive", title: "Contenido interactivo o adjunto", detail: "Se detectaron elementos no orientados a impresión. El RIP puede ignorarlos o rechazar el documento; aplana una copia de producción.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
-  if (pdfStructure.layerState === "orphaned") checks.push({ id: "layers", title: `${pdfStructure.layerCount} capas OCG huérfanas`, detail: "El PDF contiene capas opcionales, pero el catálogo principal no tiene OCProperties para registrarlas. Esta inconsistencia fue confirmada en archivos rechazados por PhotoPRINT.", severity: "error", value: "NO APTO", scope: "rip" });
-  else if (pdfStructure.layerState === "registered") checks.push({ id: "layers", title: `${pdfStructure.layerCount} capa${pdfStructure.layerCount === 1 ? "" : "s"} PDF correctamente registrada${pdfStructure.layerCount === 1 ? "" : "s"}`, detail: "Las capas OCG están declaradas en el catálogo del documento. Su sola presencia no impide el ripeo.", severity: "pass", value: "CORRECTO", scope: "rip" });
-  else if (pdfStructure.layerState === "none") checks.push({ id: "layers", title: "Sin capas PDF opcionales", detail: "No se detectaron grupos de contenido opcional OCG; el contenido está aplanado respecto de capas PDF.", severity: "pass", value: "APLANADO", scope: "rip" });
-  else checks.push({ id: "layers", title: "Registro de capas no concluyente", detail: "La estructura comprimida no permite confirmar el registro de todas las capas sin reescribir el documento.", severity: "info", value: "NO CONCLUYENTE", scope: "info" });
-  if (pdfStructure.formXObjectCount > 10) checks.push({ id: "forms", title: `${pdfStructure.formXObjectCount} formularios gráficos internos`, detail: "No es un bloqueo por sí solo, pero explica una estructura más compleja que la versión aplanada y se incluye para comparar archivos similares.", severity: "info", value: `${pdfStructure.formXObjectCount} Form XObjects`, scope: "info" });
-  if (pdfStructure.iccProfileCount > 1) checks.push({ id: "icc-duplicates", title: `${pdfStructure.iccProfileCount} referencias ICC internas`, detail: "El archivo repite perfiles de color en distintos recursos. No se rechaza solo por esto, pero aumenta el tamaño y la complejidad interna.", severity: "info", value: `${pdfStructure.iccProfileCount} ICC`, scope: "info" });
-  if (hasJpeg2000) checks.push({ id: "jpx", title: "Imágenes JPEG 2000", detail: "El filtro JPXDecode no está soportado por todos los intérpretes RIP. Convierte esas imágenes a TIFF/ZIP o JPEG convencional si PhotoPRINT no abre el archivo.", severity: "warning", value: "COMPATIBILIDAD", scope: "rip" });
-  if (hasComplexBlend) checks.push({ id: "blend", title: "Modos de fusión avanzados", detail: "Se detectaron modos distintos de Normal. La apariencia puede cambiar o fallar al rasterizar; prueba o aplana transparencias.", severity: "warning", value: "RIESGO RIP", scope: "rip" });
-  if (hasOverprint) checks.push({ id: "overprint", title: "Sobreimpresión activa", detail: "La sobreimpresión puede producir un resultado diferente si el RIP no respeta la configuración. Verifica separaciones y simulación de sobreimpresión.", severity: "warning", value: "REVISAR", scope: "quality" });
-  if (isPdf2) checks.push({ id: "pdf2", title: "Documento PDF 2.0", detail: "Algunos RIP instalados solo admiten PDF 1.7 o anterior. Exporta una copia PDF 1.6/1.7 si el archivo no ingresa.", severity: "warning", value: "COMPATIBILIDAD", scope: "rip" });
-
-  if (totalPages > maxPages) checks.push({ id: "coverage", title: `Análisis detallado limitado a ${maxPages} páginas`, detail: `El archivo tiene ${totalPages} páginas. La interpretación estructural es válida, pero PPI y texto corresponden a las primeras ${maxPages}.`, severity: "info", value: `${maxPages}/${totalPages}`, scope: "info" });
-
-  const ripErrors = checks.filter((check) => check.scope === "rip" && check.severity === "error").length;
-  const ripWarnings = checks.filter((check) => check.scope === "rip" && check.severity === "warning").length;
-  const qualityErrors = checks.filter((check) => check.scope === "quality" && check.severity === "error").length;
-  const qualityWarnings = checks.filter((check) => check.scope === "quality" && check.severity === "warning").length;
-  const status: Status = ripErrors ? "blocked" : ripWarnings ? "caution" : "ready";
-  const qualityStatus: Status = qualityErrors ? "blocked" : qualityWarnings ? "caution" : "ready";
+  const verdict = iccVerdict(iccUsages, outputIntents);
+  const status: Status = findings.some((finding) => finding.severity === "error") ? "blocked"
+    : findings.length ? "caution" : "ready";
 
   await pdf.destroy();
   return {
@@ -614,13 +772,13 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     fileName: file.name,
     fileSize: file.size,
     status,
-    qualityStatus,
     format: extension === "ai" ? "Illustrator · PDF compatible" : "PDF",
     pdfVersion: version,
     pages: totalPages,
     pagesAnalyzed: maxPages,
     dimensions: Array.from(dimensions).slice(0, 5),
-    checks,
+    findings,
+    facts,
     colorSpaces,
     dominantColors: detectedColors,
     sourceColors,
@@ -641,6 +799,15 @@ async function analyzeFile(file: File, targetPpi: number): Promise<Analysis> {
     missingFontResources: pdfStructure.missingFontResources,
     formXObjectCount: pdfStructure.formXObjectCount,
     iccProfileCount: pdfStructure.iccProfileCount,
+    iccVerdict: verdict,
+    iccProfiles: summarizeIccUsages(iccUsages),
+    outputIntents,
+    pdfxVersion: pdfx.version,
+    spotInks,
+    imageColorSpaces,
+    mirrored: { mirrored: mirroredPlacements, upright: uprightPlacements },
+    pageGeometry,
+    riskFeatures,
     thumbnail,
     visualHash,
     fileHash,
@@ -679,8 +846,12 @@ function sourceColorSummary(analysis: Analysis) {
     : "No extraíble desde operadores";
 }
 
-function qualityLabel(status: Status) {
-  return status === "ready" ? "CALIDAD APROBADA" : status === "caution" ? "CALIDAD A REVISAR" : "CALIDAD INSUFICIENTE";
+
+function mirrorLabel(analysis: Analysis) {
+  const { mirrored, upright } = analysis.mirrored;
+  if (mirrored === 0 && upright === 0) return "No medible";
+  if (mirrored > 0 && upright > 0) return "Mixto";
+  return mirrored > 0 ? "Espejado" : "Al derecho";
 }
 
 function ppiLabel(analysis: Analysis) {
@@ -739,7 +910,7 @@ export function PreflightApp() {
       try {
         analyzed.push({ file, analysis: await analyzeFile(file, PROFILES[profile].dpi) });
       } catch {
-        analyzed.push({ file, analysis: emptyAnalysis(file, "", { id: "unexpected", title: "No se pudo completar el análisis", detail: "El archivo agotó la memoria disponible o contiene una estructura inesperada.", severity: "error", value: "NO APTO" }) });
+        analyzed.push({ file, analysis: emptyAnalysis(file, "", { id: "sin-analisis", title: "No se pudo terminar de revisar", detail: "El archivo es demasiado pesado o tiene una estructura inesperada y se cortó el análisis." }) });
       }
       setProgress({ done: index + 1, total: candidates.length, name: file.name });
     }
@@ -785,12 +956,21 @@ export function PreflightApp() {
       `Archivos: ${items.length} · Aptos: ${summary.ready} · Con advertencias: ${summary.caution} · No aptos: ${summary.blocked}`,
       "",
       ...items.flatMap(({ analysis }) => [
-        `${analysis.fileName} — Compatibilidad: ${statusLabel(analysis.status)} · ${qualityLabel(analysis.qualityStatus)}`,
+        `${analysis.fileName} — ${statusLabel(analysis.status)}`,
         `Formato: ${analysis.format} · Páginas: ${analysis.pages ?? "—"} · Tamaño: ${analysis.dimensions.join(" / ") || "—"}`,
-        `PPI reales: ${ppiLabel(analysis)} · Perfil: ${analysis.profileName}`,
-        `Color: ${analysis.colorSpaces.join(" + ") || "No concluyente"} · Colores originales: ${sourceColorSummary(analysis)}`,
+        `PPI reales: ${ppiLabel(analysis)}`,
+        `Gestión de color: ${analysis.iccVerdict.label} — ${analysis.iccVerdict.summary}`,
+        ...(analysis.iccProfiles.length
+          ? analysis.iccProfiles.map((item) => `  · ICC ${item.role}: ${item.name} [${item.space}, ICC ${item.version}, ${item.deviceClass}, intención ${item.renderingIntent.toLowerCase()}]${item.issues.length ? ` — ${item.issues.join(" ")}` : ""}`)
+          : ["  · Sin perfiles ICC incrustados"]),
+        `Condición de salida: ${analysis.outputIntents.map((item) => item.outputConditionIdentifier || item.subtype || "sin nombre").join(" · ") || "no declarada"}${analysis.pdfxVersion ? ` · ${analysis.pdfxVersion}` : ""}`,
+        `Color: ${analysis.colorSpaces.join(" + ") || "No concluyente"} · Imágenes: ${analysis.imageColorSpaces.join(" · ") || "sin imágenes"}`,
+        `Colores originales: ${sourceColorSummary(analysis)}`,
+        `Tintas directas: ${analysis.spotInks.map((ink) => `${ink.name}${ink.alternate ? ` → ${ink.alternate}` : ""}`).join(" · ") || "ninguna"}`,
+        `Espejo: ${mirrorLabel(analysis).toLowerCase()}`,
         `Texto: ${analysis.hasText ? `Sí, ${analysis.textCharacters} caracteres` : "No detectado"}`,
-        ...analysis.checks.map((check) => `[${check.severity.toUpperCase()}] ${check.title}: ${check.detail}`),
+        ...(analysis.findings.length ? analysis.findings.map((finding) => `[${finding.severity === "error" ? "CORREGIR" : "REVISAR"}] ${finding.title}. ${finding.detail}`) : ["Sin nada para revisar."]),
+        ...analysis.facts.map((fact) => `${fact.label}: ${fact.value}${fact.note ? ` (${fact.note})` : ""}`),
         "",
       ]),
       "Este informe no reemplaza el preflight interno del RIP ni una prueba física.",
@@ -816,11 +996,11 @@ export function PreflightApp() {
           <div className="hero-copy">
             <p className="kicker">PREFLIGHT POR LOTE PARA SUBLIMACIÓN</p>
             <h1>Compara antes<br />de <em>ripear.</em></h1>
-            <p className="hero-lead">Carga uno o varios PDF/AI. RIPcheck calcula PPI efectivos, identifica perfiles, colores y texto, y compara las diferencias técnicas y visuales entre archivos.</p>
-            <div className="trust-row"><span><b>01</b> PPI reales</span><span><b>02</b> Perfil y color</span><span><b>03</b> Comparación de archivos</span></div>
+            <p className="hero-lead">Carga uno o varios PDF/AI. RIPcheck lee los perfiles ICC incrustados uno por uno y dice si están puestos como corresponde o si los adjuntó sola la aplicación de diseño. Controla que todo el color sea CMYK, mide la tinta, el espejo, el sangrado y las tintas directas, y marca lo que el RIP no va a interpretar igual que la pantalla.</p>
+            <div className="trust-row"><span><b>01</b> ICC real, no solo el nombre</span><span><b>02</b> Todo en CMYK</span><span><b>03</b> Comparación de archivos</span></div>
           </div>
           <div className="upload-panel">
-            <div className="field-label"><span>Objetivo de resolución</span><span>300 ppp ideal</span></div>
+            <div className="field-label"><span>Objetivo de resolución</span><span>{PROFILES[profile].dpi} ppp</span></div>
             <div className="profile-grid" role="radiogroup" aria-label="Objetivo de resolución">
               {(Object.keys(PROFILES) as ProfileKey[]).map((key) => <button key={key} className={profile === key ? "profile active" : "profile"} onClick={() => setProfile(key)} role="radio" aria-checked={profile === key}><span>{PROFILES[key].name}</span><b>{PROFILES[key].dpi} ppp{key === "ideal" ? " · ideal" : ""}</b></button>)}
             </div>
@@ -843,8 +1023,8 @@ export function PreflightApp() {
           </div>
 
           <div className={`batch-banner ${batchStatus}`}>
-            <div><p className="result-label">COMPATIBILIDAD DEL LOTE</p><h1>{batchStatus === "blocked" ? `${summary.blocked} archivo${summary.blocked === 1 ? " no es interpretable" : "s no son interpretables"}` : batchStatus === "caution" ? "Hay archivos que exigen prueba en RIP" : "Sin bloqueos RIP detectados"}</h1><p>{items.length} archivo{items.length === 1 ? "" : "s"} comparado{items.length === 1 ? "" : "s"}. La calidad se informa por separado para no confundir resolución/color con compatibilidad.</p></div>
-            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Aptos</span><span className="count-caution"><b>{summary.caution}</b>Con riesgo</span><span className="count-blocked"><b>{summary.blocked}</b>No aptos</span></div>
+            <div><p className="result-label">RESULTADO</p><h1>{batchStatus === "blocked" ? `${summary.blocked} archivo${summary.blocked === 1 ? "" : "s"} con algo para corregir` : batchStatus === "caution" ? "Se pueden imprimir, hay puntos para mirar" : "Todo en orden"}</h1><p>{items.length} archivo{items.length === 1 ? "" : "s"} revisado{items.length === 1 ? "" : "s"}.</p></div>
+            <div className="batch-counts"><span className="count-ready"><b>{summary.ready}</b>Sin nada</span><span className="count-caution"><b>{summary.caution}</b>Para mirar</span><span className="count-blocked"><b>{summary.blocked}</b>Para corregir</span></div>
           </div>
 
           {working && <div className="inline-progress"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /><p>Analizando {progress.name} · {progress.done}/{progress.total}</p></div>}
@@ -853,19 +1033,20 @@ export function PreflightApp() {
             {items.map(({ analysis }) => <div className="file-tab-shell" key={analysis.id}><button className={selected?.analysis.id === analysis.id ? "file-tab active" : "file-tab"} onClick={() => setSelectedId(analysis.id)}><i className={analysis.status} /> <span>{analysis.fileName}</span><b>{ppiLabel(analysis)}</b></button><button className="file-remove" type="button" onClick={() => removeFile(analysis.id)} aria-label={`Eliminar ${analysis.fileName}`} title="Eliminar archivo">×</button></div>)}
           </nav>
 
-          {selected && <FileDetail file={selected.file} analysis={selected.analysis} targetPpi={PROFILES[profile].dpi} />}
+          {selected && <FileDetail file={selected.file} analysis={selected.analysis} />}
           {items.length > 1 && <Comparison items={items} />}
 
-          <section className="rip-checklist"><div><p className="kicker">DECISIÓN DE PRODUCCIÓN</p><h2>Compatibilidad y calidad no son lo mismo</h2><p>Un archivo puede abrir en el RIP y tener mala resolución; también puede verse perfecto y contener capas, XFA o filtros que el RIP instalado no interpreta. Por eso ahora se informan por separado y sin puntuación artificial.</p></div><ol><li><span>1</span><div><b>Compatibilidad RIP</b><small>Estructura y funciones PDF de riesgo</small></div></li><li><span>2</span><div><b>Calidad de impresión</b><small>PPI, perfil, color y sobreimpresión</small></div></li><li><span>3</span><div><b>Espejo una sola vez</b><small>En el archivo o en el RIP</small></div></li><li><span>4</span><div><b>Prueba física</b><small>Confirma color y transferencia</small></div></li></ol></section>
-          <p className="disclaimer">RIPcheck inspecciona los datos PDF reales en el navegador. La similitud visual compara la primera página; el PPI, texto y tamaños se analizan hasta 100 páginas por archivo.</p>
+          <section className="rip-checklist"><div><p className="kicker">CÓMO LEER ESTO</p><h2>Solo se avisa lo que hay que mirar</h2><p>Si no aparece ninguna alerta, el archivo no tiene nada raro. Lo demás son datos, no problemas: el tamaño, el perfil y la cantidad de tinta están ahí para consultarlos, no para preocuparse.</p></div><ol><li><span>1</span><div><b>Para corregir</b><small>El archivo no va a salir bien así</small></div></li><li><span>2</span><div><b>Para mirar</b><small>Se imprime, pero conviene verlo en la prueba</small></div></li><li><span>3</span><div><b>Ver dónde</b><small>Marca en la vista la zona exacta</small></div></li><li><span>4</span><div><b>Datos del archivo</b><small>Información, sin alarma</small></div></li></ol></section>
+          <p className="disclaimer">RIPcheck lee el PDF de verdad, en esta computadora. Las zonas marcadas corresponden a la primera página.</p>
         </section>
       ) : null}
     </main>
   );
 }
 
-function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analysis; targetPpi: number }) {
+function FileDetail({ file, analysis }: { file: File; analysis: Analysis }) {
   const [selectedColorId, setSelectedColorId] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [eyedropper, setEyedropper] = useState(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
@@ -890,6 +1071,7 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
     setEyedropper(false);
     setSelectedColorId(null);
     setSampledPoint(null);
+    setHighlight(null);
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
@@ -932,24 +1114,18 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
     setSelectedColorId(object.colorId);
     setSampledPoint({ analysisId: analysis.id, x, y, kind: object.kind, objectId: object.id });
   };
+  const highlighted = analysis.findings.find((finding) => finding.id === highlight)?.rects ?? [];
   const selectEmptyPoint = (event: ReactMouseEvent<SVGSVGElement>) => {
     if (!eyedropper) return;
     const { x, y } = sampledCoordinates(event);
     setSelectedColorId(null);
     setSampledPoint({ analysisId: analysis.id, x, y, kind: "empty", objectId: null });
   };
-  const groups = {
-    ripErrors: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "error"),
-    ripWarnings: analysis.checks.filter((check) => check.scope === "rip" && check.severity === "warning"),
-    quality: analysis.checks.filter((check) => check.scope === "quality" && (check.severity === "error" || check.severity === "warning")),
-    information: analysis.checks.filter((check) => check.severity === "info"),
-    passes: analysis.checks.filter((check) => check.severity === "pass"),
-  };
   return <section className="file-detail">
     <div className="visual-column">
       <div className="detail-heading"><span>Vista vectorial · PDF original</span><small>{analysis.dimensions[0] || "Sin tamaño"}</small></div>
       <div className="preview-toolbar" aria-label="Controles de la vista real"><span>Rueda exclusiva para zoom · 50% a 4000%</span><button type="button" onClick={() => changeZoom(-1)} disabled={zoom <= 0.5} aria-label="Alejar">−</button><button className="zoom-value" type="button" onClick={() => setExactZoom(1)} title="Volver al 100%">{Math.round(zoom * 100)}%</button><button type="button" onClick={() => changeZoom(1)} disabled={zoom >= 40} aria-label="Acercar">+</button></div>
-      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><svg className={eyedropper ? "vector-object-map active" : "vector-object-map"} viewBox="0 0 1 1" preserveAspectRatio="none" onClick={selectEmptyPoint} aria-label={eyedropper ? `${analysis.paintRegions.length} objetos seleccionables en la primera página` : "Mapa de objetos vectoriales"}>{analysis.paintRegions.map((object) => <path key={object.id} className={`vector-hit ${object.paint} ${currentSample?.objectId === object.id ? "selected" : ""}`} d={object.d} fill={object.paint === "fill" ? "rgba(0,0,0,.001)" : "none"} fillRule={object.fillRule} stroke={object.paint === "stroke" ? "rgba(0,0,0,.001)" : "none"} strokeWidth={Math.max(object.strokeWidth, 0.004)} onClick={(event) => selectVectorObject(event, object)}><title>{object.kind === "raster" ? "Imagen ráster" : object.kind === "text" ? "Objeto de texto" : "Trazado vectorial"}</title></path>)}</svg>{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
+      <div ref={stageRef} className={eyedropper ? "thumb-stage eyedropper-active" : "thumb-stage"}>{pdfUrl && analysis.thumbnail ? <div className="vector-surface" style={{ width: `${zoom * 100}%`, aspectRatio: `${pageRatio}` }}><object className="vector-object" data={`${pdfUrl}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`} type="application/pdf" aria-label={`Vista vectorial original de ${analysis.fileName}`}><img src={analysis.thumbnail} alt={`Primera página de ${analysis.fileName}`} /></object><svg className={eyedropper ? "vector-object-map active" : "vector-object-map"} viewBox="0 0 1 1" preserveAspectRatio="none" onClick={selectEmptyPoint} aria-label={eyedropper ? `${analysis.paintRegions.length} objetos seleccionables en la primera página` : "Mapa de objetos vectoriales"}>{analysis.paintRegions.map((object) => <path key={object.id} className={`vector-hit ${object.paint} ${currentSample?.objectId === object.id ? "selected" : ""}`} d={object.d} fill={object.paint === "fill" ? "rgba(0,0,0,.001)" : "none"} fillRule={object.fillRule} stroke={object.paint === "stroke" ? "rgba(0,0,0,.001)" : "none"} strokeWidth={Math.max(object.strokeWidth, 0.004)} onClick={(event) => selectVectorObject(event, object)}><title>{object.kind === "raster" ? "Imagen ráster" : object.kind === "text" ? "Objeto de texto" : "Trazado vectorial"}</title></path>)}</svg>{currentSample && <span className="sample-marker" style={{ left: `${currentSample.x * 100}%`, top: `${currentSample.y * 100}%` }} aria-hidden="true" />}{highlighted.map((rect, index) => <span key={index} className="finding-marker" style={{ left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.w * 100}%`, height: `${rect.h * 100}%` }} aria-hidden="true" />)}</div> : <div className="preview-fallback invalid"><span>AI</span><p>Sin representación vectorial PDF compatible.</p></div>}</div>
       {analysis.thumbnail && <img ref={sampleImageRef} className="sampling-source" src={analysis.thumbnail} alt="" aria-hidden="true" onLoad={(event) => setPageRatio(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />}
       <div className="color-readout">
         <span>CUENTAGOTAS DE OBJETOS REALES</span>
@@ -960,36 +1136,55 @@ function FileDetail({ file, analysis, targetPpi }: { file: File; analysis: Analy
       </div>
     </div>
     <div className="technical-column">
-      <div className="status-pair"><div className={`single-status ${analysis.status}`}><span>COMPATIBILIDAD RIP</span><b>{statusLabel(analysis.status)}</b></div><div className={`single-status quality ${analysis.qualityStatus}`}><span>CALIDAD DE IMPRESIÓN</span><b>{qualityLabel(analysis.qualityStatus)}</b></div></div>
-      <div className="metric-grid">
-        <Metric label="PPI EFECTIVOS" value={ppiLabel(analysis)} hint={`Objetivo ${targetPpi} ppp`} tone={analysis.ppiMin !== null && analysis.ppiMin < 100 ? "bad" : analysis.ppiMin !== null && analysis.ppiMin < targetPpi ? "warn" : "good"} />
-        <Metric label="PERFIL DEL ARCHIVO" value={analysis.profileName} hint="ICC / intención de salida" />
-        <Metric label="COLOR" value={analysis.colorSpaces.join(" + ") || "No concluyente"} hint={analysis.colorSpaces.includes("CMYK") ? "CMYK detectado" : "Sin CMYK detectable"} />
-        <Metric label="TEXTO" value={analysis.hasText ? "Sí contiene" : "No detectado"} hint={analysis.hasText ? `${analysis.textCharacters.toLocaleString("es-UY")} caracteres` : "Puede estar trazado"} />
-        <Metric label="PÁGINAS" value={String(analysis.pages ?? "—")} hint={analysis.dimensions.join(" · ") || "Sin tamaño legible"} />
-        <Metric label="IMÁGENES RÁSTER" value={String(analysis.imageCount)} hint={`${analysis.ppiPlacements} colocaciones medibles`} />
-        <Metric label="CAPAS PDF" value={layerLabel(analysis)} hint="Registro OCG del documento" tone={analysis.layerState === "orphaned" ? "bad" : analysis.layerState === "unknown" ? "warn" : "good"} />
-        <Metric label="RECURSOS INTERNOS" value={resourceIntegrityLabel(analysis)} hint={`${analysis.formXObjectCount} formularios · ${analysis.iccProfileCount} ICC`} tone={analysis.missingFontResources.length ? "bad" : "good"} />
+      <div className={`verdict ${analysis.status}`}>
+        <b>{analysis.status === "blocked" ? "Hay algo que corregir" : analysis.status === "caution" ? "Se puede imprimir, mirá estos puntos" : "Listo para imprimir"}</b>
+        <span>{analysis.findings.length === 0 ? "No se encontró nada para revisar." : `${analysis.findings.length} ${analysis.findings.length === 1 ? "cosa" : "cosas"} para revisar.`}</span>
       </div>
-      {analysis.spotColors.length > 0 && <div className="spot-line"><span>Tintas directas</span><b>{analysis.spotColors.join(" · ")}</b></div>}
-      {analysis.hasText && <div className="text-sample"><span>TEXTO DETECTADO</span><p>{analysis.textPreview || "Texto presente sin contenido extraíble."}</p><small>{analysis.fontNames.length ? `Fuentes: ${analysis.fontNames.join(", ")}` : "Fuentes sin nombre legible"}</small></div>}
-      <div className="checklist compact">{groups.ripErrors.length > 0 && <CheckGroup title="Bloqueos de compatibilidad RIP" checks={groups.ripErrors} tone="error" />}{groups.ripWarnings.length > 0 && <CheckGroup title="Riesgos que exigen prueba en RIP" checks={groups.ripWarnings} tone="warning" />}{groups.quality.length > 0 && <CheckGroup title="Problemas de calidad de impresión" checks={groups.quality} tone={groups.quality.some((check) => check.severity === "error") ? "error" : "warning"} />}{groups.information.length > 0 && <CheckGroup title="Alcance del análisis" checks={groups.information} tone="warning" />}{groups.passes.length > 0 && <CheckGroup title="Controles aprobados" checks={groups.passes} tone="pass" />}</div>
+
+      {analysis.findings.length > 0 && <div className="findings">
+        {analysis.findings.map((finding) => {
+          const open = highlight === finding.id;
+          return <article key={finding.id} className={`finding ${finding.severity} ${open ? "open" : ""}`}>
+            <div className="finding-head">
+              <h3>{finding.title}</h3>
+              <small>{finding.badge}</small>
+            </div>
+            <p>{finding.detail}</p>
+            {finding.rects.length > 0 && <button type="button" className={open ? "locate active" : "locate"} onClick={() => setHighlight(open ? null : finding.id)}>
+              {open ? "Ocultar en la vista" : `Ver dónde (${finding.rects.length} ${finding.rects.length === 1 ? "zona" : "zonas"})`}
+            </button>}
+          </article>;
+        })}
+      </div>}
+
+      <div className="facts">
+        <span className="facts-title">Datos del archivo</span>
+        <dl>
+          {analysis.facts.map((fact) => <div key={fact.label}>
+            <dt>{fact.label}</dt>
+            <dd>{fact.value}{fact.note && <small>{fact.note}</small>}</dd>
+          </div>)}
+        </dl>
+      </div>
     </div>
   </section>;
 }
 
-function Metric({ label, value, hint, tone }: { label: string; value: string; hint: string; tone?: "good" | "warn" | "bad" }) {
-  return <div className={`metric ${tone || ""}`}><span>{label}</span><b>{value}</b><small>{hint}</small></div>;
-}
 
 function Comparison({ items }: { items: BatchItem[] }) {
   const base = items[0].analysis;
   const rows = [
     { label: "Compatibilidad RIP", get: (a: Analysis) => statusLabel(a.status) },
-    { label: "Calidad de impresión", get: (a: Analysis) => qualityLabel(a.qualityStatus) },
+
     { label: "PPI reales", get: ppiLabel },
-    { label: "Perfil ICC", get: (a: Analysis) => a.profileName },
+    { label: "Estado del ICC", get: (a: Analysis) => a.iccVerdict.label },
+    { label: "Perfiles ICC", get: (a: Analysis) => a.iccProfiles.length ? a.iccProfiles.map((item) => `${item.name} (${item.role.toLowerCase()})`).join(" / ") : "Ninguno" },
+    { label: "Condición de salida", get: (a: Analysis) => a.outputIntents.map((item) => item.outputConditionIdentifier || item.subtype || "sin nombre").join(" · ") || "No declarada" },
+    { label: "Norma PDF/X", get: (a: Analysis) => a.pdfxVersion || "No declarada" },
     { label: "Espacios de color", get: (a: Analysis) => a.colorSpaces.join(" + ") || "No concluyente" },
+    { label: "Espacios de las imágenes", get: (a: Analysis) => a.imageColorSpaces.join(" · ") || "Sin imágenes" },
+    { label: "Espejo", get: mirrorLabel },
+    { label: "Tintas directas", get: (a: Analysis) => a.spotInks.map((ink) => ink.name).join(" · ") || "Ninguna" },
     { label: "Colores originales", get: sourceColorSummary },
     { label: "Texto", get: (a: Analysis) => a.hasText ? `Sí · ${a.textCharacters} caracteres` : "No detectado" },
     { label: "Integridad de recursos", get: resourceIntegrityLabel },
@@ -1006,9 +1201,4 @@ function Comparison({ items }: { items: BatchItem[] }) {
     <div className="section-heading visual-heading"><div><p className="kicker">COMPARACIÓN VISUAL</p><h2>Similitud de la primera página</h2></div><p>Referencia: {base.fileName}</p></div>
     <div className="visual-compare-grid">{items.map(({ analysis }) => { const similarity = visualSimilarity(base, analysis); return <article key={analysis.id} className="compare-card">{analysis.thumbnail ? <img src={analysis.thumbnail} alt={`Miniatura de ${analysis.fileName}`} /> : <div className="no-thumb">Sin vista</div>}<div><b>{analysis.fileName}</b><span>{analysis.fileHash === base.fileHash ? (analysis.id === base.id ? "Archivo de referencia" : "Duplicado exacto") : similarity === null ? "No comparable" : similarity >= 90 ? `${similarity}% · Casi idéntico` : similarity >= 70 ? `${similarity}% · Similar` : `${similarity}% · Visualmente diferente`}</span></div></article>; })}</div>
   </section>;
-}
-
-function CheckGroup({ title, checks, tone }: { title: string; checks: Check[]; tone: "error" | "warning" | "pass" }) {
-  const [open, setOpen] = useState(tone !== "pass");
-  return <section className={`check-group ${tone}`}><button className="group-title" onClick={() => setOpen(!open)} aria-expanded={open}><span><i>{tone === "error" ? "×" : tone === "warning" ? "!" : "✓"}</i>{title}<b>{checks.length}</b></span><em>{open ? "−" : "+"}</em></button>{open && <div className="check-items">{checks.map((check) => <article className="check-item" key={check.id}><span className="check-dot">{check.severity === "error" ? "×" : check.severity === "pass" ? "✓" : check.severity === "info" ? "i" : "!"}</span><div><h3>{check.title}</h3><p>{check.detail}</p></div>{check.value && <small>{check.value}</small>}</article>)}</div>}</section>;
 }
