@@ -51,5 +51,4 @@ next-env.d.ts
 # de 100 MB por archivo que impone GitHub
 /dist-app*/
 /release/win-unpacked/
-/release/*.exe
 /release/*.zip
